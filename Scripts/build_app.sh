@@ -80,6 +80,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'EOF'
     <string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Open Claude Code in Terminal for the selected account.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

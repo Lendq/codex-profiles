@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
+    @State private var service = 0
     @AppStorage("remote_view") private var remoteView = false
 
     @AppStorage("hide_emails") private var hideEmails = false
@@ -19,13 +20,16 @@ struct ContentView: View {
     @FocusState private var nameFocused: Bool
 
     var body: some View {
-        Group {
-            if remoteView { RemoteView(model: model, remote: model.remote) }
+        VStack(spacing: 0) {
+            Picker("Service", selection: $service) { Text("Codex").tag(0); Text("Claude Code").tag(1) }
+                .pickerStyle(.segmented).padding(10)
+            if service == 1 { ClaudeProfilesView() }
+            else if remoteView { RemoteView(model: model, remote: model.remote) }
             else { profilesView }
         }
         .frame(minWidth: 420, minHeight: 300)
         .safeAreaInset(edge: .top) {
-            if showSearch && !remoteView {
+            if showSearch && !remoteView && service == 0 {
                 TextField("Search profiles", text: $searchText)
                     .textFieldStyle(.roundedBorder)
                     .focused($searchFocused)
@@ -48,6 +52,7 @@ struct ContentView: View {
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTargeted, perform: handleDrop(providers:))
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                if service == 0 {
                 Button { remoteView.toggle() } label: {
                     Label(remoteView ? "Profiles" : "Remote", systemImage: remoteView ? "person.crop.rectangle.stack" : "link")
                 }
@@ -81,6 +86,7 @@ struct ContentView: View {
                 }
                 .disabled(model.isWorking || !model.currentProfile.isAvailable)
                 .help("Sign out locally, preserving the saved session")
+                }
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {

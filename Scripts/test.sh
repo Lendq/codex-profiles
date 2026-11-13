@@ -22,3 +22,8 @@ swiftc "${SDK_ARGS[@]}" -I "$ROOT_DIR/.build/tests" -L "$ROOT_DIR/.build/tests" 
     "$ROOT_DIR/Tests/CodexProfilesTests/RemoteTests.swift" \
     "$ROOT_DIR/Tests/CodexProfilesTests/AccountPickerTests.swift"
 "$ROOT_DIR/.build/tests/profile-tests"
+
+swiftc "${SDK_ARGS[@]}" -o "$ROOT_DIR/.build/tests/claude-support-tests" \
+    "$ROOT_DIR/Sources/CodexProfilesApp/ClaudeSupport.swift" \
+    "$ROOT_DIR/Tests/ClaudeSupportTests/main.swift"
+"$ROOT_DIR/.build/tests/claude-support-tests"
