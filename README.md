@@ -22,11 +22,15 @@ This is a community fork of [qwersyk/codex-profiles](https://github.com/qwersyk/
 
 ## Claude Code accounts
 
-Select **Claude Code**, add a named account, then choose **Open** and a project folder. Claude Code will ask you to sign in on the first launch. Your original account remains available as **Current Claude account**. Each additional account has its own Claude configuration folder and Keychain login.
+Select **Claude Code** to manage accounts using the same cards and profile editor as Codex. The current login appears by email. Save it with the plus button, or choose **Sign In New Profile** and follow the prompts in Terminal. Once signed in, exit Claude Code to finish saving the account. The arrow on a saved card selects that account for subsequent normal Claude Code launches.
 
-To switch conversations, choose **Switch & Continue…** on the destination account, select the project folder, and choose a saved conversation. Claude Code opens a fork in a new Terminal session; the original stays intact. This is a manual handoff, not an automatic switch at a usage limit, and it does not replace the account in an already-running process.
+Claude Code processes can cache and refresh their login. Close all Claude Code sessions before adding, switching, or removing Claude profiles; the app checks this to protect stored logins. A conversation can then be resumed in the usual Claude Code session. Existing profiles created by this fork's earlier launcher are preserved and imported when selected.
 
-User- and project-local MCP server definitions from the original `~/.claude.json` are passed to newly launched profiles; project `.mcp.json` files remain available normally. Server OAuth sign-ins are separate, so authenticate again with `/mcp` if needed. Shared definitions are refreshed on each launch. Other settings and extensions are not automatically shared. The macOS automation permission for Terminal may be requested on first use.
+The active `~/.claude` configuration, project history, and MCP server definitions remain shared. The switcher also preserves the active MCP OAuth sign-ins where present. Usage limits refresh in the background and can also be refreshed with the toolbar button; the app sends the account's access token only to Anthropic's usage endpoint. Expired logins may require another sign-in, and an MCP server may require authorization again.
+
+The app uses the MIT-licensed [ccswitch](https://github.com/2hmad/ccswitch) switching helper (based on commit `d303f8f`, modified for locking, rollback and local sign-out), bundled under `Vendor/ccswitch`. Python 3 must be available on the Mac. macOS's active Claude login is kept in Keychain. Saved Claude account credential snapshots and MCP sign-ins are held in owner-only files under `~/.config/codex-profiles-claude`; protect that folder like a password. Do not copy a saved login to multiple machines: rotating refresh tokens can invalidate another copy. ccswitch's macOS support is marked experimental upstream.
+
+Claude profiles can be exported and imported individually. Export files contain login credentials: keep them private, and do not use the same login on multiple machines because refresh-token rotation can invalidate a copy. Automatic session renewal is not yet implemented. Claude does not change the account of a running process during a switch.
 
 ## Build
 

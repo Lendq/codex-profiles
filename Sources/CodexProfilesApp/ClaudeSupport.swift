@@ -55,4 +55,25 @@ enum ClaudeSupport {
         return result.sorted { $0.modified > $1.modified }
     }
 
+    struct UsageReading {
+        let id: String
+        let used: Double
+        let minutes: Int
+        let resets: Date?
+    }
+
+    static func parseUsage(_ data: Data) throws -> [UsageReading] {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "ClaudeUsage", code: 1, userInfo: [NSLocalizedDescriptionKey: "Claude returned an unexpected usage response."])
+        }
+        let formatter = ISO8601DateFormatter()
+        let fractional = ISO8601DateFormatter(); fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return [("five_hour", 300), ("seven_day", 10080)].compactMap { key, duration in
+            guard let item = json[key] as? [String: Any], let used = item["utilization"] as? NSNumber, used.doubleValue.isFinite else { return nil }
+            let raw = item["resets_at"] as? String
+            let date = raw.flatMap { fractional.date(from: $0) ?? formatter.date(from: $0) }
+            return UsageReading(id: key, used: max(0, min(100, used.doubleValue)), minutes: duration, resets: date)
+        }
+    }
+
 }

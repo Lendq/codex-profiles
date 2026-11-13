@@ -27,3 +27,13 @@ swiftc "${SDK_ARGS[@]}" -o "$ROOT_DIR/.build/tests/claude-support-tests" \
     "$ROOT_DIR/Sources/CodexProfilesApp/ClaudeSupport.swift" \
     "$ROOT_DIR/Tests/ClaudeSupportTests/main.swift"
 "$ROOT_DIR/.build/tests/claude-support-tests"
+"$ROOT_DIR/Scripts/test_claude_switch.sh"
+swiftc "${SDK_ARGS[@]}" -o "$ROOT_DIR/.build/tests/claude-model-tests" \
+    "$ROOT_DIR/Sources/CodexProfilesApp/ClaudeSupport.swift" \
+    "$ROOT_DIR/Sources/CodexProfilesApp/AccountUsage.swift" \
+    "$ROOT_DIR/Sources/CodexProfilesApp/ClaudeUsageClient.swift" \
+    "$ROOT_DIR/Sources/CodexProfilesApp/ClaudeSwitchModel.swift" \
+    "$ROOT_DIR/Sources/CodexProfilesApp/ClaudeBackup.swift" \
+    "$ROOT_DIR/Tests/ClaudeBackupTests.swift" \
+    "$ROOT_DIR/Tests/ClaudeSwitchModelTests/main.swift"
+"$ROOT_DIR/.build/tests/claude-model-tests" "$ROOT_DIR/Vendor/ccswitch/bin/ccswitch"

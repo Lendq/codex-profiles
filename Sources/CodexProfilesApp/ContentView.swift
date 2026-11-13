@@ -3,7 +3,8 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
-    @State private var service = 0
+    @ObservedObject var claudeModel: ClaudeSwitchModel
+    @AppStorage("active_profile_service") private var service = 0
     @AppStorage("remote_view") private var remoteView = false
 
     @AppStorage("hide_emails") private var hideEmails = false
@@ -23,13 +24,13 @@ struct ContentView: View {
         VStack(spacing: 0) {
             Picker("Service", selection: $service) { Text("Codex").tag(0); Text("Claude Code").tag(1) }
                 .pickerStyle(.segmented).padding(10)
-            if service == 1 { ClaudeProfilesView() }
+            if service == 1 { ClaudeProfilesView(searchText: searchText, model: claudeModel) }
             else if remoteView { RemoteView(model: model, remote: model.remote) }
             else { profilesView }
         }
         .frame(minWidth: 420, minHeight: 300)
         .safeAreaInset(edge: .top) {
-            if showSearch && !remoteView && service == 0 {
+            if showSearch && (!remoteView || service == 1) {
                 TextField("Search profiles", text: $searchText)
                     .textFieldStyle(.roundedBorder)
                     .focused($searchFocused)
@@ -49,7 +50,9 @@ struct ContentView: View {
                 .allowsHitTesting(false)
                 .animation(.easeOut(duration: 0.15), value: isDropTargeted)
         }
-        .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTargeted, perform: handleDrop(providers:))
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTargeted) { providers in
+            service == 0 && handleDrop(providers: providers)
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 if service == 0 {
@@ -90,7 +93,7 @@ struct ContentView: View {
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            if !remoteView && (model.isWorking || !model.loadingUsage.isEmpty) {
+            if service == 0 && !remoteView && (model.isWorking || !model.loadingUsage.isEmpty) {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.mini).frame(width: 12, height: 12)
                     Text(model.switchingProfileID != nil ? "Switching profile · restarting ChatGPT…" : model.isWorking ? "Working…" : "Updating limits…")
@@ -103,7 +106,7 @@ struct ContentView: View {
         }
         .disabled(model.isWorking && !model.isRenewingSession)
         .onReceive(NotificationCenter.default.publisher(for: .saveCurrentProfile)) { _ in
-            guard !model.isWorking, prompt == nil else { return }
+            guard service == 0, !model.isWorking, prompt == nil else { return }
             Task { await addCurrentProfile() }
         }
         .sheet(item: $sessionRow) { row in
@@ -313,7 +316,7 @@ struct ContentView: View {
     }
 }
 
-private struct ProfileRowView: View {
+struct ProfileRowView: View {
     let row: ProfileRow
     let hideEmails: Bool
     let canRenew: Bool
@@ -327,6 +330,8 @@ private struct ProfileRowView: View {
     let renewAction: () -> Void
     let signInAction: () -> Void
     let addAction: () -> Void
+    var claudeMode = false
+    var claudeCanExport = true
 
     var body: some View {
         HStack(spacing: 10) {
@@ -398,7 +403,12 @@ private struct ProfileRowView: View {
                     .disabled(isBusy)
             } else {
                 HStack(spacing: 6) {
-                    ProfileActionsMenu(actions: [
+                    ProfileActionsMenu(actions: claudeMode ? [
+                        .init(title: "Edit Profile", symbol: "pencil", enabled: !isBusy, action: renameAction),
+                        .init(title: "Export Profile…", symbol: "square.and.arrow.up", enabled: !isBusy && claudeCanExport, action: exportAction),
+                        .init(title: "Sign In Again…", symbol: "person.crop.circle.badge.plus", enabled: !isBusy, action: signInAction),
+                        .init(title: "Delete Profile…", symbol: "trash", enabled: !isBusy, action: { confirmDelete = true })
+                    ] : [
                         .init(title: "Edit Profile", symbol: "pencil", enabled: !isBusy, action: renameAction),
                         .init(title: "Export Profile", symbol: "square.and.arrow.up", enabled: !isBusy, action: exportAction),
                         .init(title: "Session & Limits…", symbol: "info.circle", action: detailsAction),
@@ -407,7 +417,7 @@ private struct ProfileRowView: View {
                         .init(title: "Delete Profile…", symbol: "trash", enabled: !isBusy, action: { confirmDelete = true })
                     ])
                     .frame(width: 28, height: 28)
-                    QuotaSwitch(row: row, isBusy: isBusy, action: loadAction)
+                    QuotaSwitch(row: row, isBusy: isBusy, action: loadAction, isClaude: claudeMode)
                 }
             }
         }
@@ -415,7 +425,7 @@ private struct ProfileRowView: View {
             Button("Cancel", role: .cancel) {}
             Button("Delete", role: .destructive, action: deleteAction)
         } message: {
-            Text("This removes the saved copy from this app. Your current ChatGPT session remains available.")
+            Text(claudeMode ? "This removes the saved profile from this app. The current Claude Code login remains available." : "This removes the saved copy from this app. Your current ChatGPT session remains available.")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -525,10 +535,11 @@ struct QuotaSwitch: View {
     let row: ProfileRow
     let isBusy: Bool
     let action: () -> Void
+    var isClaude = false
 
     private var windows: [UsageWindow] { row.usage?.indicatorWindows ?? [] }
     private var hint: String {
-        var text = row.isSwitching ? "Switching profile…" : row.isCurrent ? "Current profile" : !restartOnProfileSwitch ? "Switch without restart" : "Switch to this profile (restarts ChatGPT)"
+        var text = row.isSwitching ? "Switching profile…" : row.isCurrent ? "Current profile" : isClaude ? "Switch Claude Code account" : !restartOnProfileSwitch ? "Switch without restart" : "Switch to this profile (restarts ChatGPT)"
         for window in windows {
             text += "\n\(window.durationLabel): \(Int(window.remainingPercent))% remaining"
             if let countdown = window.resetCountdown(at: Date()) { text += " · " + countdown }
@@ -577,7 +588,7 @@ private struct IconPill: View {
     }
 }
 
-private struct NamePromptView: View {
+struct NamePromptView: View {
     @Binding var draftName: String
     @Binding var draftAvatarSymbol: String
     @Binding var draftAvatarColorToken: String

@@ -41,3 +41,11 @@ check(process.terminationStatus == 0, "launch command runs")
 let lines = try String(contentsOf: output, encoding: .utf8).split(separator: "\n").map(String.init)
 check(lines == ["/tmp/profile's dir", "unset", "--mcp-config", "/tmp/mcp config", "--resume", "/tmp/session's file.jsonl", "--fork-session"], "handoff arguments and environment")
 print("Claude handoff checks passed")
+let usageJSON = Data("""
+{"five_hour":{"utilization":72,"resets_at":"2026-10-18T18:10:00.299994+00:00"},"seven_day":{"utilization":41,"resets_at":"2026-10-22T03:00:00Z"}}
+""".utf8)
+let usage = try ClaudeSupport.parseUsage(usageJSON)
+check(usage.count == 2 && usage[0].used == 72 && usage[1].minutes == 10080, "Claude quota windows")
+check(usage.allSatisfy { $0.resets != nil }, "Claude reset times")
+let missingUsage = try ClaudeSupport.parseUsage(Data("{\"five_hour\":null}".utf8))
+check(missingUsage.isEmpty, "missing quota")

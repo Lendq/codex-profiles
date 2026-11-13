@@ -1,128 +1,79 @@
 import SwiftUI
-import AppKit
 
-private struct ClaudeAccount: Codable, Identifiable {
-    var id: UUID
-    var name: String
-    var isDefault: Bool
+extension Notification.Name {
+    static let saveCurrentClaudeProfile = Notification.Name("saveCurrentClaudeProfile")
+    static let loginClaudeProfile = Notification.Name("loginClaudeProfile")
+    static let refreshClaudeUsage = Notification.Name("refreshClaudeUsage")
 }
 
 struct ClaudeProfilesView: View {
-    @State private var accounts: [ClaudeAccount] = loadAccounts()
+    var searchText: String
+    @ObservedObject var model: ClaudeSwitchModel
+    @AppStorage("hide_emails") private var hideEmails = false
+    @AppStorage("sort_order") private var sortOrderRaw = SortOrder.recent.rawValue
+    @State private var editID: UUID?
     @State private var name = ""
-    @State private var adding = false
-    @State private var message: String?
+    @State private var symbol = AvatarOption.person.rawValue
+    @State private var tint = AvatarTintOption.blue.rawValue
 
-    private static let key = "claude_profiles_v1"
-    private static func loadAccounts() -> [ClaudeAccount] {
-        guard let data = UserDefaults.standard.data(forKey: key),
-              let accounts = try? JSONDecoder().decode([ClaudeAccount].self, from: data) else {
-            return [ClaudeAccount(id: UUID(), name: "Current Claude account", isDefault: true)]
-        }
-        return accounts
+    private var rows: [ProfileRow] {
+        model.orderedRows(SortOrder(rawValue: sortOrderRaw) ?? .recent, search: searchText, hideEmails: hideEmails)
     }
-    private func save() {
-        if let data = try? JSONEncoder().encode(accounts) { UserDefaults.standard.set(data, forKey: Self.key) }
-    }
-    private func launch(_ account: ClaudeAccount, continuing: Bool = false) {
-        let panel = NSOpenPanel()
-        panel.title = "Choose a project folder"
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        guard panel.runModal() == .OK, let project = panel.url else { return }
-        do {
-            let fm = FileManager.default
-            let base = fm.homeDirectoryForCurrentUser.appendingPathComponent(".local/share/codex-profiles/claude", isDirectory: true)
-            let dir = base.appendingPathComponent(account.id.uuidString, isDirectory: true)
-            if !account.isDefault { try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
-            let global = fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude.json")
-            var mcpPath: String?
-            if !account.isDefault, fm.fileExists(atPath: global.path) {
-                let servers = try ClaudeSupport.servers(from: Data(contentsOf: global), project: project)
-                if !servers.isEmpty {
-                    let config = dir.appendingPathComponent("shared-mcp.json")
-                    let content = try JSONSerialization.data(withJSONObject: ["mcpServers": servers])
-                    try content.write(to: config, options: .atomic)
-                    try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: config.path)
-                    mcpPath = config.path
-                }
-            }
-            let path = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude", fm.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/claude").path].first(where: { fm.isExecutableFile(atPath: $0) })
-            guard let executable = path else { throw NSError(domain: "Claude", code: 1, userInfo: [NSLocalizedDescriptionKey: "Claude Code was not found."]) }
-            var resumePath: String?
-            if continuing {
-                let roots = accounts.map { source in
-                    (source.name, source.isDefault ? fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude") : base.appendingPathComponent(source.id.uuidString))
-                }
-                let sessions = ClaudeSupport.sessions(roots: roots, project: project)
-                guard !sessions.isEmpty else { message = "No saved conversations were found for this folder."; return }
-                let chooser = NSAlert()
-                chooser.messageText = "Choose a conversation to continue"
-                chooser.informativeText = "A copy opens with the selected account. Your original conversation stays in place."
-                let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
-                let formatter = DateFormatter(); formatter.dateStyle = .medium; formatter.timeStyle = .short
-                for session in sessions.prefix(100) {
-                    popup.addItem(withTitle: "\(session.account) · \(formatter.string(from: session.modified)) · \(session.url.deletingPathExtension().lastPathComponent.prefix(8))")
-                }
-                chooser.accessoryView = popup
-                chooser.addButton(withTitle: "Continue")
-                chooser.addButton(withTitle: "Cancel")
-                guard chooser.runModal() == .alertFirstButtonReturn, popup.indexOfSelectedItem >= 0 else { return }
-                resumePath = sessions[popup.indexOfSelectedItem].url.resolvingSymlinksInPath().path
-            }
-            let command = ClaudeSupport.command(executable: executable, project: project.path, configDirectory: account.isDefault ? nil : dir.path, mcpConfig: mcpPath, resumeFile: resumePath)
-            let script = "tell application \"Terminal\"\n activate\n do script " + "\"" + command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"\nend tell"
-            var error: NSDictionary?
-            guard let apple = NSAppleScript(source: script) else { throw NSError(domain: "Terminal", code: 1) }
-            apple.executeAndReturnError(&error)
-            if let error = error { throw NSError(domain: "Terminal", code: 1, userInfo: [NSLocalizedDescriptionKey: error.description]) }
-        } catch { message = error.localizedDescription }
-    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Claude Code accounts").font(.headline)
-                Spacer()
-                Button("Add Account") { name = ""; adding = true }
-            }
-            Text("Open an account in Terminal, or continue a saved conversation with it. New accounts sign in on first launch. MCP definitions from your existing setup are shared; server sign-ins may be needed again.")
-                .font(.caption).foregroundStyle(.secondary)
-            ScrollView {
-              LazyVStack(spacing: 8) {
-              ForEach(accounts) { account in
-                HStack {
-                    Image(systemName: "person.crop.circle")
-                    VStack(alignment: .leading) {
-                        Text(account.name)
-                        Text(account.isDefault ? "Existing Claude Code setup" : "Separate Claude Code sign-in").font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button("Switch & Continue…") { launch(account, continuing: true) }
-                    Button("Open") { launch(account) }
-                    if !account.isDefault {
-                        Button(role: .destructive) {
-                            let confirm = NSAlert(); confirm.messageText = "Remove this account from the list?"
-                            confirm.informativeText = "Its sign-in and conversation files remain on this Mac. Removing it here makes it inaccessible from this list."
-                            confirm.addButton(withTitle: "Remove"); confirm.addButton(withTitle: "Cancel")
-                            if confirm.runModal() == .alertFirstButtonReturn { accounts.removeAll { $0.id == account.id }; save() }
-                        } label: { Image(systemName: "minus.circle") }
-                            .help("Remove from list; account data is kept")
-                    }
-                }.padding(10).background(Color(nsColor: .controlBackgroundColor)).cornerRadius(8)
-            }
-              }
-            }
-        }.padding(14)
-        .sheet(isPresented: $adding) {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("Add Claude account").font(.headline)
-                TextField("Account name", text: $name)
-                Text("Claude Code will ask you to sign in when you open it.").font(.caption).foregroundStyle(.secondary)
-                HStack { Spacer(); Button("Cancel") { adding = false }; Button("Add") {
-                    accounts.append(ClaudeAccount(id: UUID(), name: name.trimmingCharacters(in: .whitespacesAndNewlines), isDefault: false)); save(); adding = false
-                }.disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || accounts.contains { $0.name.localizedCaseInsensitiveCompare(name.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame }) }
-            }.padding(20).frame(width: 360)
+        ScrollView {
+            LazyVStack(spacing: 8) {
+                ForEach(rows) { row in
+                    ProfileRowView(row: row, hideEmails: hideEmails, canRenew: false, isBusy: model.busy,
+                        renameAction: {
+                            guard let id = row.profileID else { return }
+                            editID = id; name = row.title
+                            symbol = row.avatarSymbol ?? AvatarOption.person.rawValue
+                            tint = row.avatarColorToken ?? AvatarTintOption.blue.rawValue
+                        },
+                        loadAction: { if let id = row.profileID { model.switchTo(id) } },
+                        deleteAction: { if let id = row.profileID { model.delete(id) } },
+                        exportAction: { if let id = row.profileID { model.exportProfile(id) } }, detailsAction: {}, renewAction: {},
+                        signInAction: { model.login(row.profileID) },
+                        addAction: { model.saveCurrent() }, claudeMode: true, claudeCanExport: row.profileID.map { model.hasSaved($0) } ?? false)
+
+                }
+                if rows.isEmpty {
+                    Text(searchText.isEmpty ? "No saved profiles" : "No matching profiles").font(.headline)
+                    Text("Sign in to add a Claude Code account.").foregroundStyle(.secondary)
+                    Image(systemName: "person.crop.circle.badge.plus").font(.system(size: 22, weight: .medium)).foregroundStyle(.secondary).padding(.top, 80)
+                }
+            }.padding(10)
         }
-        .alert("Claude Code", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) { Button("OK") { message = nil } } message: { Text(message ?? "") }
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button { model.login() } label: { Label("Sign In New Profile", systemImage: "person.crop.circle.badge.plus") }
+                    .help("Add Claude account with browser sign-in")
+                Button { model.importProfile() } label: { Label("Import Profiles", systemImage: "square.and.arrow.down") }
+                    .help("Import a Claude profile backup")
+                Button { model.saveCurrent() } label: { Label("Save Current Profile", systemImage: "tray.and.arrow.down") }
+                    .disabled(!model.rows.contains(where: { $0.isUnsavedCurrent }))
+                    .help("Save current Claude account")
+                Button { model.signOutLocally() } label: { Label("Sign Out Locally", systemImage: "rectangle.portrait.and.arrow.right") }
+                    .disabled(!model.rows.contains(where: { $0.isCurrent && !$0.isUnsavedCurrent }))
+                    .help("Sign out locally, preserving the saved Claude profile")
+                Button { model.refreshUsage() } label: { Label("Refresh Limits", systemImage: "arrow.clockwise") }
+                    .disabled(model.loadingUsage)
+                    .help("Refresh Claude usage limits")
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .saveCurrentClaudeProfile)) { _ in model.saveCurrent() }
+        .onReceive(NotificationCenter.default.publisher(for: .loginClaudeProfile)) { _ in model.login() }
+        .onReceive(NotificationCenter.default.publisher(for: .refreshClaudeUsage)) { _ in model.refreshUsage() }
+        .onAppear { model.reload(); model.refreshUsage(interactive: false) }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.reload() }
+        .sheet(isPresented: Binding(get: { editID != nil }, set: { if !$0 { editID = nil } })) {
+            NamePromptView(draftName: $name, draftAvatarSymbol: $symbol, draftAvatarColorToken: $tint,
+                confirmAction: { if let id = editID { model.update(id, name: name, symbol: symbol, tint: tint) }; editID = nil },
+                cancelAction: { editID = nil })
+        }
+        .alert("Claude Code", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
+            Button("OK") { model.errorMessage = nil }
+        } message: { Text(model.errorMessage ?? "") }
     }
 }

@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct CodexProfilesApp: App {
     @StateObject private var model = AppModel()
+    @StateObject private var claudeModel = ClaudeSwitchModel()
     @Environment(\.openWindow) private var openWindow
     @AppStorage("restart_on_profile_switch") private var restartOnProfileSwitch = false
     @AppStorage("show_menu_bar") private var showMenuBar = false
@@ -11,6 +12,7 @@ struct CodexProfilesApp: App {
     @AppStorage("renew_inactive_sessions") private var renewInactiveSessions = true
     @AppStorage("renewal_lead_days") private var renewalLeadDays = 1
     @AppStorage("sort_order") private var sortOrderRaw = SortOrder.recent.rawValue
+    @AppStorage("active_profile_service") private var activeService = 0
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     private func shortcutTitle(_ row: ProfileRow) -> String {
@@ -20,7 +22,7 @@ struct CodexProfilesApp: App {
 
     var body: some Scene {
         Window("Codex Profiles", id: "profiles") {
-            ContentView(model: model)
+            ContentView(model: model, claudeModel: claudeModel)
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                     Task {
                         try? await Task.sleep(nanoseconds: 200_000_000)
@@ -34,6 +36,7 @@ struct CodexProfilesApp: App {
                         Task { await model.importFiles(urls) }
                     }
                     model.startMaintenance()
+                    claudeModel.reload()
                 }
         }
         .defaultSize(width: 560, height: 430)
@@ -41,10 +44,10 @@ struct CodexProfilesApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Save Current Profile") {
-                    NotificationCenter.default.post(name: .saveCurrentProfile, object: nil)
+                    NotificationCenter.default.post(name: activeService == 1 ? .saveCurrentClaudeProfile : .saveCurrentProfile, object: nil)
                 }
                 .keyboardShortcut("s", modifiers: .command)
-                .disabled(model.isWorking || !model.currentProfile.isAvailable)
+                .disabled(activeService == 0 && (model.isWorking || !model.currentProfile.isAvailable))
             }
             CommandGroup(after: .toolbar) {
                 Toggle("Show in Menu Bar", isOn: $showMenuBar)
@@ -57,6 +60,28 @@ struct CodexProfilesApp: App {
                 }
             }
             CommandMenu("Profiles") {
+              if activeService == 1 {
+                Button("Sign In New Profile") { NotificationCenter.default.post(name: .loginClaudeProfile, object: nil) }
+                    .keyboardShortcut("n", modifiers: [.command, .shift])
+                Button("Import Profile…") { claudeModel.importProfile() }
+                    .keyboardShortcut("i", modifiers: .command)
+                Button("Refresh All Limits") { claudeModel.refreshUsage() }
+                    .keyboardShortcut("r", modifiers: [.command, .shift])
+                Button("Sign Out Locally") { claudeModel.signOutLocally() }
+                    .keyboardShortcut("l", modifiers: [.command, .shift])
+                    .disabled(!claudeModel.rows.contains(where: { $0.isCurrent && !$0.isUnsavedCurrent }))
+                Menu("Switch to Profile") {
+                    ForEach(claudeModel.orderedRows(SortOrder(rawValue: sortOrderRaw) ?? .recent).filter { $0.profileID != nil }) { row in
+                        if let id = row.profileID, let number = row.shortcutNumber {
+                            Button(shortcutTitle(row)) { claudeModel.switchTo(id) }
+                                .keyboardShortcut(KeyEquivalent(Character(String(number))), modifiers: .command)
+                                .disabled(row.isCurrent)
+                        } else if let id = row.profileID {
+                            Button(shortcutTitle(row)) { claudeModel.switchTo(id) }.disabled(row.isCurrent)
+                        }
+                    }
+                }
+              } else {
                 Button("Sign In New Profile") { Task { await model.startBrowserLoginProfile() } }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
                     .disabled(model.isWorking)
@@ -107,12 +132,57 @@ struct CodexProfilesApp: App {
                 Button("Sign Out Locally") { Task { await model.logoutCodex() } }
                     .keyboardShortcut("l", modifiers: [.command, .shift])
                     .disabled(model.isWorking)
+              }
             }
         }
         MenuBarExtra("Codex Profiles", systemImage: "person.crop.rectangle.stack", isInserted: $showMenuBar) {
-            ProfileMenuBarView(model: model)
+            if activeService == 1 { ClaudeMenuBarView(model: claudeModel) }
+            else { ProfileMenuBarView(model: model) }
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+private struct ClaudeMenuBarView: View {
+    @ObservedObject var model: ClaudeSwitchModel
+    @AppStorage("sort_order") private var sortOrderRaw = SortOrder.recent.rawValue
+    @AppStorage("hide_emails") private var hideEmails = false
+    @Environment(\.openWindow) private var openWindow
+    @State private var hoveredID: String?
+    private var rows: [ProfileRow] { model.orderedRows(SortOrder(rawValue: sortOrderRaw) ?? .recent).filter { $0.profileID != nil } }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Claude Code Profiles").font(.headline); Spacer()
+                Button { model.refreshUsage() } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.plain).disabled(model.loadingUsage).help("Refresh all limits")
+            }
+            if rows.isEmpty { Text("Save a profile in the main window.").foregroundStyle(.secondary) }
+            ScrollView {
+                VStack(spacing: 4) {
+                    ForEach(rows) { row in
+                        Button { if let id = row.profileID { model.switchTo(id) } } label: {
+                            HStack(spacing: 10) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(hideEmails && row.title.contains("@") ? "Profile" : row.title).font(.subheadline.weight(.medium)).lineLimit(1)
+                                    if let usage = row.usage, !usage.indicatorWindows.isEmpty {
+                                        Text(usage.indicatorWindows.map { "\($0.durationLabel) · \(Int($0.remainingPercent))% left" }.joined(separator: "   ") + (usage.isStale ? " · cached" : ""))
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    } else { Text("Limits unavailable").font(.caption).foregroundStyle(.secondary) }
+                                }
+                                Spacer()
+                                if let number = row.shortcutNumber { Text("⌘\(number)").font(.caption2).foregroundStyle(.tertiary) }
+                                if row.isCurrent { Image(systemName: "checkmark").foregroundStyle(.secondary) }
+                            }.padding(.horizontal, 8).padding(.vertical, 6).contentShape(Rectangle())
+                                .background(Color.accentColor.opacity(hoveredID == row.id ? 0.18 : row.isCurrent ? 0.1 : 0), in: RoundedRectangle(cornerRadius: 8))
+                        }.buttonStyle(.plain).onHover { hoveredID = $0 ? row.id : nil }
+                    }
+                }
+            }.frame(height: min(300, CGFloat(rows.count) * 48))
+            if let error = model.errorMessage { Text(error).font(.caption).foregroundStyle(.red).lineLimit(3) }
+            Divider()
+            HStack { Button("Open Window") { openWindow(id: "profiles"); NSApp.activate(ignoringOtherApps: true) }; Spacer(); Button("Quit") { NSApp.terminate(nil) } }
+        }.padding(12).frame(width: 270).onAppear { model.reload(); model.refreshUsage(interactive: false) }
     }
 }
 

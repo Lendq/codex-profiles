@@ -1,0 +1,1533 @@
+#!/usr/bin/env bash
+#
+# ccswitch - switch between multiple Claude Code accounts
+#
+# Everything stays shared: MCP servers, plugins, skills, agents, commands,
+# session history, settings and CLAUDE.md all live in one ~/.claude.
+# Only the credential (and the identity it belongs to) is swapped.
+#
+# https://github.com/2hmad/ccswitch
+# MIT licensed.
+
+set -euo pipefail
+
+VERSION="0.9.1"
+
+# --- locations --------------------------------------------------------------
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  CC_DIR="$CLAUDE_CONFIG_DIR"
+  CC_JSON="$CLAUDE_CONFIG_DIR/.claude.json"
+else
+  CC_DIR="$HOME/.claude"
+  CC_JSON="$HOME/.claude.json"
+fi
+CRED="$CC_DIR/.credentials.json"
+
+# --- credential backend -----------------------------------------------------
+# Linux keeps the OAuth credential in a file. macOS keeps it in the login
+# keychain, under a service name Claude Code derives from its config dir.
+# Both hold the same JSON, so everything above this layer is backend-agnostic.
+#
+# Service: "Claude Code" + "-credentials" + ("-" + sha256(config dir)[:8] when
+# CLAUDE_CONFIG_DIR is set). Account: $USER, or "claude-code-user" if that is
+# unset or has characters outside [a-zA-Z0-9._-].
+if [ -n "${CCSWITCH_BACKEND:-}" ]; then
+  BACKEND="$CCSWITCH_BACKEND"
+elif [ "$(uname -s)" = "Darwin" ]; then
+  # Claude Code prefers Keychain on macOS even when a stale plaintext
+  # fallback exists. Selecting by file presence splits the two tools' state.
+  BACKEND="keychain"
+else
+  BACKEND="file"
+fi
+
+kc_service() {
+  local extra=""
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    extra="-$(python3 - "$CC_DIR" <<'PYEOF'
+import hashlib, sys, unicodedata
+d = unicodedata.normalize("NFC", sys.argv[1])
+print(hashlib.sha256(d.encode("utf-8")).hexdigest()[:8])
+PYEOF
+)"
+  fi
+  printf 'Claude Code-credentials%s' "$extra"
+}
+
+kc_account() {
+  local u="${USER:-}"
+  [ -n "$u" ] || u="$(id -un 2>/dev/null || true)"
+  case "$u" in
+    ""|*[!a-zA-Z0-9._-]*) u="claude-code-user" ;;
+  esac
+  printf '%s' "$u"
+}
+
+# Present? 0 if a live credential exists.
+cred_exists() {
+  if [ "$BACKEND" = "keychain" ]; then
+    security find-generic-password -a "$(kc_account)" -s "$(kc_service)" >/dev/null 2>&1
+  else
+    [ -f "$CRED" ]
+  fi
+}
+
+# Print the live credential JSON on stdout.
+cred_read() {
+  if [ "$BACKEND" = "keychain" ]; then
+    security find-generic-password -a "$(kc_account)" -s "$(kc_service)" -w 2>/dev/null
+  else
+    cat "$CRED"
+  fi
+}
+
+# Install $1 (a file of credential JSON) as the live credential.
+cred_write() {  # $1=source file
+  if [ "$BACKEND" = "keychain" ]; then
+    # security -w returns hex if the stored bytes include newlines or other
+    # non-printable bytes. Claude expects JSON, so store compact ASCII JSON
+    # without a trailing newline. -X is only the write transport encoding.
+    local hex; hex="$(python3 -c 'import json,sys;sys.stdout.write(json.dumps(json.load(open(sys.argv[1])),ensure_ascii=True,allow_nan=False,separators=(",",":")).encode("ascii").hex())' "$1")" \
+      || { warn "invalid credential JSON - refusing to overwrite the login keychain"; return 1; }
+    security add-generic-password -U -a "$(kc_account)" -s "$(kc_service)" -X "$hex" \
+      || { warn "could not write to the login keychain (is it unlocked?)"; return 1; }
+  else
+    mkdir -p "$CC_DIR"
+    cp "$1" "$CRED" || return 1
+    chmod 600 "$CRED" || return 1
+  fi
+}
+
+# Remove the live credential.
+cred_clear() {
+  if [ "$BACKEND" = "keychain" ]; then
+    security delete-generic-password -a "$(kc_account)" -s "$(kc_service)" >/dev/null 2>&1 || true
+  else
+    rm -f "$CRED"
+  fi
+}
+
+VAULT="${CCSWITCH_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/ccswitch}"
+ACCOUNTS="$VAULT/accounts"
+ACTIVE_FILE="$VAULT/active"
+
+# Keys in .claude.json that belong to the signed-in account rather than to
+# your configuration. These travel with the credential; everything else
+# (mcpServers, projects, tips, onboarding state...) stays put and shared.
+IDENTITY_KEYS='("oauthAccount","userID")'
+
+# --- output -----------------------------------------------------------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  B=$'\033[1m'; DIM=$'\033[2m'; GRN=$'\033[32m'; YLW=$'\033[33m'; RED=$'\033[31m'; RST=$'\033[0m'
+else
+  B=""; DIM=""; GRN=""; YLW=""; RED=""; RST=""
+fi
+
+info() { printf '%s\n' "$*"; }
+warn() { printf '%swarning:%s %s\n' "$YLW" "$RST" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
+
+# --- prerequisites ----------------------------------------------------------
+command -v python3 >/dev/null 2>&1 || die "python3 is required but not installed"
+
+case "$(uname -s)" in
+  Linux|Darwin) ;;
+  *) warn "untested platform: $(uname -s)" ;;
+esac
+
+if [ "$BACKEND" = "keychain" ]; then
+  command -v security >/dev/null 2>&1 ||
+    die "the 'security' command was not found - it is required to read the macOS keychain"
+fi
+
+mkdir -p "$ACCOUNTS"
+chmod 700 "$VAULT" 2>/dev/null || true
+
+# --- json helpers -----------------------------------------------------------
+identity_extract() {  # $1=.claude.json  -> identity json on stdout
+  python3 - "$1" <<PYEOF
+import json, os, sys
+p = sys.argv[1]
+d = json.load(open(p)) if os.path.exists(p) else {}
+print(json.dumps({k: d[k] for k in $IDENTITY_KEYS if k in d}, indent=2))
+PYEOF
+}
+
+identity_apply() {  # $1=.claude.json  $2=identity.json
+  python3 - "$1" "$2" <<PYEOF
+import json, os, sys, tempfile
+tp, ip = sys.argv[1], sys.argv[2]
+if os.path.islink(tp): tp = os.path.realpath(tp)
+t = json.load(open(tp)) if os.path.exists(tp) else {}
+i = json.load(open(ip)) if os.path.exists(ip) else {}
+for k in $IDENTITY_KEYS:
+    t.pop(k, None)
+t.update(i)
+parent = os.path.dirname(tp) or "."
+os.makedirs(parent, exist_ok=True)
+mode = (os.stat(tp).st_mode & 0o777) if os.path.exists(tp) else 0o600
+fd, tmp = tempfile.mkstemp(prefix=".claude-profile-", dir=parent)
+try:
+    os.fchmod(fd, mode)
+    with os.fdopen(fd, "w") as out:
+        json.dump(t, out, indent=2)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, tp)
+finally:
+    if os.path.exists(tmp): os.unlink(tmp)
+PYEOF
+}
+
+acct_email() {  # $1=account name
+  python3 - "$ACCOUNTS/$1/identity.json" <<'PYEOF'
+import json, os, sys
+p = sys.argv[1]
+if not os.path.exists(p):
+    print("-"); raise SystemExit
+d = json.load(open(p))
+print((d.get("oauthAccount") or {}).get("emailAddress") or "-")
+PYEOF
+}
+
+# Report a credential file as: "<access secs>|<refresh secs>", where either
+# field may be "none". A cleared credential - Claude Code empties the tokens in
+# place when the server rejects a refresh with invalid_grant - reports "dead".
+cred_state() {  # $1=path to a credentials.json
+  python3 - "$1" <<'PYEOF'
+import json, os, sys, time
+p = sys.argv[1]
+if not os.path.exists(p):
+    print("none|none"); raise SystemExit
+try:
+    d = json.load(open(p))
+    o = d.get("claudeAiOauth") or {}
+    if not (o.get("accessToken") or "").strip() or not (o.get("refreshToken") or "").strip():
+        print("dead|dead"); raise SystemExit
+    def left(k):
+        v = o.get(k)
+        return str(int(v / 1000 - time.time())) if v else "none"
+    print("%s|%s" % (left("expiresAt"), left("refreshTokenExpiresAt")))
+except SystemExit:
+    raise
+except Exception:
+    print("none|none")
+PYEOF
+}
+
+# True when the live credential holds usable tokens (not cleared by a rejected
+# refresh). Guards every snapshot, so a dead session cannot overwrite a good slot.
+cred_live_ok() {
+  local tmp; tmp="$(mktemp)"
+  cred_read > "$tmp" 2>/dev/null || true
+  local st; st="$(cred_state "$tmp")"
+  rm -f "$tmp"
+  [ "${st%%|*}" != "dead" ] && [ "${st%%|*}" != "none" ]
+}
+
+acct_expiry() {  # $1=account name -> access seconds remaining, "none" or "dead"
+  local st; st="$(cred_state "$ACCOUNTS/$1/credentials.json")"
+  printf '%s' "${st%%|*}"
+}
+
+acct_refresh_expiry() {  # $1=account name -> refresh-token seconds, "none"/"dead"
+  local st; st="$(cred_state "$ACCOUNTS/$1/credentials.json")"
+  printf '%s' "${st##*|}"
+}
+
+fmt_left() {  # $1=seconds, "none" or "dead"
+  local s="$1"
+  if [ "$s" = "dead" ]; then printf 'BROKEN - re-login'; return; fi
+  if [ "$s" = "none" ]; then printf 'unknown'; return; fi
+  if [ "$s" -le 0 ]; then printf 'expired %dh ago' $(( -s / 3600 )); return; fi
+  printf 'valid %dh %dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+}
+
+fmt_status() {  # $1=access seconds, "none" or "dead"
+  case "$1" in
+    dead) printf '%sBROKEN - re-login%s' "$RED" "$RST" ;;
+    *)    printf 'ready' ;;
+  esac
+}
+
+fmt_relogin() {  # $1=refresh-token seconds, "none" or "dead"
+  local s="$1"
+  case "$s" in
+    dead) printf '%sBROKEN - re-login%s' "$RED" "$RST" ;;
+    none) printf 'ready' ;;
+    *) if [ "$s" -le 0 ]; then printf '%slogin expired%s' "$RED" "$RST"
+       else printf 're-login in %s' "$(fmt_days "$s")"; fi ;;
+  esac
+}
+
+fmt_days() {  # $1=seconds, "none" or "dead"
+  local s="$1"
+  case "$s" in dead) printf '-';; none) printf '?';; *) printf '%dd' $(( s / 86400 ));; esac
+}
+
+# --- state ------------------------------------------------------------------
+active_name() { if [ -f "$ACTIVE_FILE" ]; then cat "$ACTIVE_FILE"; fi; }
+acct_exists() { [ -d "$ACCOUNTS/$1" ]; }
+
+validate_name() {
+  case "$1" in
+    ""|*[!a-zA-Z0-9._-]*) die "invalid account name '$1' (use letters, digits, . _ -)" ;;
+  esac
+}
+
+# True only when an interactive Claude Code session is running. Several
+# long-lived helpers share the same binary and process name - notably the
+# Claude-in-Chrome native messaging host, which Chrome keeps alive for as long
+# as the browser is open. Matching those would block every switch and login
+# indefinitely, so candidates are filtered by their command line.
+claude_session_pids() {
+  local bin pids p cmd
+  bin="$(command -v claude 2>/dev/null)" || return 0
+  [ -n "$bin" ] || return 0
+  pids="$( { pgrep -x claude; pgrep -f -- "$bin"; } 2>/dev/null | sort -un)"
+  for p in $pids; do
+    cmd="$(ps -o args= -p "$p" 2>/dev/null)" || continue
+    [ -n "$cmd" ] || continue
+    case "$cmd" in
+      # Chrome's native messaging host, not a session
+      *--chrome-native-host*) continue ;;
+      # stdio MCP server, likewise long-lived and credential-free
+      *" mcp serve"*|*" mcp start"*) continue ;;
+      # ccswitch itself, or a shell whose command line merely mentions the path
+      *ccswitch*) continue ;;
+    esac
+    printf '%s\n' "$p"
+  done
+}
+
+claude_running() {
+  [ -n "$(claude_session_pids)" ]
+}
+
+# --- MCP server tokens --------------------------------------------------------
+# Claude Code keeps the OAuth tokens of MCP servers (mcpOAuth) in the same blob
+# as the Claude login, but they belong to your Figma, Sentry... sign-in, not to
+# the Claude account. Restoring each account's own copy hands back tokens a
+# renewal has since consumed, forcing a fresh MCP sign-in after every switch.
+# So they live in one pool shared by every account, and a switch swaps only the
+# Claude login. An isolated account keeps its own in its slot instead, for when
+# it really does sign in to a server as someone else.
+MCP_POOL="$VAULT/mcp-oauth.json"
+
+mcp_isolated() { [ -f "$ACCOUNTS/$1/mcp-isolated" ]; }
+
+# Build the pool on first run from what the vault already holds: every shared
+# account's stored copy plus the live one, keeping the newest copy of each
+# server, then give the live credential the result.
+mcp_pool_init() {
+  [ -f "$MCP_POOL" ] && return 0
+  local live="" cur d n; cur="$(active_name)"
+  local -a srcs=()
+  for d in "$ACCOUNTS"/*/; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"
+    mcp_isolated "$n" || srcs+=("$d/credentials.json")
+  done
+  if cred_exists && ! { [ -n "$cur" ] && mcp_isolated "$cur"; }; then
+    live="$(mktemp)"
+    cred_read > "$live" 2>/dev/null || true
+    srcs+=("$live")
+  fi
+  python3 - "$MCP_POOL" ${srcs[@]+"${srcs[@]}"} <<'PYEOF'
+import json, os, sys
+def exp(e):
+    return (e.get("expiresAt") or 0) if isinstance(e, dict) else 0
+pool = {}
+# Later sources win ties, and the live credential comes last.
+for p in sys.argv[2:]:
+    try:
+        m = json.load(open(p)).get("mcpOAuth") or {}
+    except Exception:
+        continue
+    if not isinstance(m, dict):
+        continue
+    for k, v in m.items():
+        a, b = exp(v), exp(pool.get(k))
+        if k not in pool or not (a and b) or a >= b:
+            pool[k] = v
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(pool, f, indent=2)
+PYEOF
+  if [ -n "$live" ]; then
+    [ -s "$live" ] && cred_install "$live" ""
+    rm -f "$live"
+  fi
+}
+
+# Print credential $1 with its mcpOAuth replaced by the JSON object in file $2,
+# or removed when $2 is empty. Every other key, claudeAiOauth included, is left
+# exactly as it is.
+mcp_with() {  # $1=credential file  $2=mcpOAuth json file, or ""
+  python3 - "$1" "$2" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d.pop("mcpOAuth", None)
+if sys.argv[2]:
+    d["mcpOAuth"] = json.load(open(sys.argv[2]))
+print(json.dumps(d))
+PYEOF
+}
+
+# Install credential $1 as live for account $2 ("" for one ccswitch does not
+# track): a shared account gets the pool's MCP tokens, an isolated one its own.
+cred_install() {  # $1=credential file  $2=account name, or ""
+  if [ -n "$2" ] && mcp_isolated "$2"; then
+    cred_write "$1"
+    return
+  fi
+  mcp_pool_init
+  local tmp; tmp="$(mktemp)"
+  if mcp_with "$1" "$MCP_POOL" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    if ! cred_write "$tmp"; then rm -f "$tmp"; return 1; fi
+  else
+    if ! cred_write "$1"; then rm -f "$tmp"; return 1; fi
+  fi
+  rm -f "$tmp"
+}
+
+# Take the MCP tokens of credential $1, captured from shared account $2, as the
+# pool. The live credential is the truth, so a server signed out of drops out
+# of the pool. A credential with no mcpOAuth key at all - a fresh /login writes
+# one - says nothing about MCP sign-ins, and leaves the pool alone.
+mcp_absorb() {  # $1=credential file  $2=account name
+  mcp_isolated "$2" && return 0
+  mcp_pool_init
+  python3 - "$1" "$MCP_POOL" <<'PYEOF'
+import json, os, sys
+try:
+    m = json.load(open(sys.argv[1])).get("mcpOAuth")
+except Exception:
+    raise SystemExit
+if not isinstance(m, dict):
+    raise SystemExit
+try:
+    if json.load(open(sys.argv[2])) == m:
+        raise SystemExit
+except SystemExit:
+    raise
+except Exception:
+    pass
+tmp = sys.argv[2] + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(m, f, indent=2)
+os.replace(tmp, sys.argv[2])
+PYEOF
+}
+
+# Snapshot the live credential+identity into an account slot.
+capture_into() {  # $1=account name
+  local n="$1" d="$ACCOUNTS/$1"
+  cred_exists || die "no live credential found - run 'claude' and /login first"
+
+  local tmp; tmp="$(mktemp)"
+  cred_read > "$tmp" 2>/dev/null || true
+  [ -s "$tmp" ] || { rm -f "$tmp"; die "the live credential came back empty - refusing to store it as '$n'"; }
+
+  # Claude Code blanks the tokens in place when the server rejects a refresh
+  # with invalid_grant. Snapshotting that would destroy a good stored slot and
+  # turn one re-login into a permanently broken account.
+  local st; st="$(cred_state "$tmp")"
+  if [ "${st%%|*}" = "dead" ]; then
+    rm -f "$tmp"
+    die "the live credential has been cleared (signed out) - refusing to overwrite '$n'.
+       Sign in again, then run 'ccswitch save'."
+  fi
+
+  local owner
+  if owner="$(login_foreign_to "$tmp" "$n")"; then
+    rm -f "$tmp"
+    die "the live credential is a renewal of '$owner''s login, not '$n''s - refusing to store it as '$n'."
+  fi
+
+  mkdir -p "$d"
+  mv "$tmp" "$d/credentials.json"
+  mcp_absorb "$d/credentials.json" "$n"
+  identity_extract "$CC_JSON" > "$d/identity.json"
+  chmod 700 "$d"; chmod 600 "$d"/*.json
+  note_host "$n"
+}
+
+# Restore an account slot into the live location.
+restore_from() {  # $1=account name
+  local n="$1" d="$ACCOUNTS/$1" previous previous_identity active_tmp had_credential=0
+  [ -f "$d/credentials.json" ] || die "account '$n' has no stored credential"
+  [ -f "$d/identity.json" ] || die "account '$n' has no stored identity"
+  previous="$(mktemp)"; previous_identity="$(mktemp)"; active_tmp="$(mktemp "$VAULT/.active.XXXXXX")"
+  identity_extract "$CC_JSON" > "$previous_identity"
+  if cred_exists; then
+    cred_read > "$previous" || { rm -f "$previous" "$previous_identity" "$active_tmp"; die "Could not read the current credential."; }
+    had_credential=1
+  fi
+  if ! cred_install "$d/credentials.json" "$n"; then
+    rm -f "$previous" "$previous_identity" "$active_tmp"
+    die "Could not install the selected Claude credential."
+  fi
+  if ! identity_apply "$CC_JSON" "$d/identity.json" || ! printf '%s\n' "$n" > "$active_tmp" || ! mv "$active_tmp" "$ACTIVE_FILE"; then
+    identity_apply "$CC_JSON" "$previous_identity" || true
+    if [ "$had_credential" = 1 ]; then cred_write "$previous"; else cred_clear; fi
+    rm -f "$previous" "$previous_identity" "$active_tmp"
+    die "Could not finish the switch; restored the previous login."
+  fi
+  rm -f "$previous" "$previous_identity" "$active_tmp"
+}
+
+# Save the live state back into whichever account is currently active, so a
+# token refreshed during the session is not lost when we switch away.
+save_active() {
+  local cur; cur="$(active_name)"
+  [ -n "$cur" ] || return 0
+  cred_exists || return 0
+  # A cleared credential is worth nothing, so there is nothing to save - but it
+  # must not stop us leaving. Being signed out is exactly when switching away
+  # matters most, and capture_into refuses a cleared credential by design.
+  cred_live_ok || {
+    warn "the live credential is signed out - leaving ${B}$cur${RST} as last saved"
+    return 0
+  }
+  # Another account's token is not this one's to save, and must not stop the
+  # switch either.
+  local tmp owner; tmp="$(mktemp)"
+  cred_read > "$tmp" 2>/dev/null || true
+  if owner="$(login_foreign_to "$tmp" "$cur")"; then
+    rm -f "$tmp"
+    warn "the live credential is ${B}$owner${RST}'s login - leaving ${B}$cur${RST} as last saved"
+    return 0
+  fi
+  rm -f "$tmp"
+  capture_into "$cur"
+}
+
+# Which machine last captured an account. Refresh tokens rotate, so a token is
+# only good for whoever holds the newest link in the chain: two machines sharing
+# one stored credential keep signing each other out. ccswitch cannot prevent
+# that - the server is the arbiter - but it can say so rather than leaving a
+# mystifying forced /login.
+this_host() { uname -n 2>/dev/null || printf 'unknown'; }
+
+note_host() {  # $1=account name
+  printf '%s\n' "$(this_host)" > "$ACCOUNTS/$1/host" 2>/dev/null || true
+  chmod 600 "$ACCOUNTS/$1/host" 2>/dev/null || true
+}
+
+# Print the other machine that last wrote $1; nothing when it was this one.
+foreign_host() {  # $1=account name
+  local f="$ACCOUNTS/$1/host" h
+  [ -f "$f" ] || return 1
+  h="$(head -1 "$f" 2>/dev/null)"
+  [ -n "$h" ] && [ "$h" != "$(this_host)" ] || return 1
+  printf '%s' "$h"
+}
+
+warn_if_shared() {
+  local d n h
+  for d in "$ACCOUNTS"/*/; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"
+    h="$(foreign_host "$n" || true)"
+    if [ -n "$h" ]; then
+      warn "last used on another machine (${B}$h${RST}) - see 'ccswitch doctor'"
+      return 0
+    fi
+  done
+}
+
+# True when credential $1 is at least as new as $2. Rotation always moves the
+# access token's expiry forward, so an older expiry means $1 is stale - a
+# leftover file from a previous install, or one restored onto a machine that
+# already had an older copy. Adopting it would throw away a live token.
+cred_newer() {  # $1=candidate  $2=incumbent
+  python3 - "$1" "$2" <<'PYEOF'
+import json, os, sys
+def exp(p):
+    try:
+        return (json.load(open(p)).get("claudeAiOauth") or {}).get("expiresAt") or 0
+    except Exception:
+        return 0
+new, old = exp(sys.argv[1]), exp(sys.argv[2])
+# No incumbent expiry: nothing to lose, accept. No candidate expiry: we cannot
+# show it is newer, so refuse rather than risk clobbering a good token.
+if not old:
+    raise SystemExit(0)
+if not new:
+    raise SystemExit(1)
+raise SystemExit(0 if new >= old else 1)
+PYEOF
+}
+
+# Which login a credential belongs to. Every login ends on a fixed date, and
+# each renewal reports that same refreshTokenExpiresAt - give or take a second
+# of clock skew - so it fingerprints the login. Unlike the email in
+# .claude.json, a session cannot overwrite it with another account's.
+LOGIN_SLACK_MS=5000
+
+# Names of stored accounts holding the same login as credential file $1.
+login_owners() {  # $1=credential file
+  python3 - "$1" "$ACCOUNTS" "$LOGIN_SLACK_MS" <<'PYEOF'
+import json, os, sys
+def end(p):
+    try:
+        return (json.load(open(p)).get("claudeAiOauth") or {}).get("refreshTokenExpiresAt") or 0
+    except Exception:
+        return 0
+f, root, slack = end(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+if f:
+    for n in sorted(os.listdir(root)):
+        g = end(os.path.join(root, n, "credentials.json"))
+        if g and abs(f - g) <= slack:
+            print(n)
+PYEOF
+}
+
+# Groups of stored accounts that hold one login between them, one per line as
+# "a and b". Only one of them can be right; the others belong to someone else.
+shared_logins() {
+  python3 - "$ACCOUNTS" "$LOGIN_SLACK_MS" <<'PYEOF'
+import json, os, sys
+root, slack = sys.argv[1], int(sys.argv[2])
+ends = []
+for n in sorted(os.listdir(root)):
+    try:
+        o = json.load(open(os.path.join(root, n, "credentials.json"))).get("claudeAiOauth") or {}
+    except Exception:
+        continue
+    if o.get("refreshTokenExpiresAt") and (o.get("refreshToken") or "").strip():
+        ends.append((o["refreshTokenExpiresAt"], n))
+ends.sort()
+group = []
+for e, n in ends:
+    if group and e - group[-1][0] > slack:
+        if len(group) > 1:
+            print(" and ".join(sorted(x for _, x in group)))
+        group = []
+    group.append((e, n))
+if len(group) > 1:
+    print(" and ".join(sorted(x for _, x in group)))
+PYEOF
+}
+
+# True when credential file $1 holds another stored account's login rather
+# than $2's. Prints that account.
+login_foreign_to() {  # $1=credential file  $2=account name
+  local owners; owners="$(login_owners "$1")"
+  [ -n "$owners" ] || return 1
+  printf '%s\n' "$owners" | grep -qxF -- "$2" && return 1
+  printf '%s' "$owners" | head -1
+}
+
+# A claude session left open as another account keeps renewing that account's
+# token and writes it over the live credential, whatever is live now. Matched
+# by email it looks like a renewal of the live account, and would overwrite
+# that slot with someone else's login. Send it to its own account instead, and
+# put the live account's token back so the next claude is who it says it is.
+route_stray() {  # $1=live credential file  $2=owning account  $3=live identity's account
+  local owner="$2" cur="$3" stored="$ACCOUNTS/$2/credentials.json"
+  # A login already stored under two names cannot say which is its own - leave
+  # both alone, and let doctor report it.
+  if [ "$(login_owners "$1" | wc -l)" -eq 1 ] &&
+     ! cmp -s "$1" "$stored" && cred_newer "$1" "$stored"; then
+    cp "$1" "$stored"
+    chmod 600 "$stored"
+    note_host "$owner"
+    warn "a claude session still signed in as ${B}$owner${RST} renewed its token - saved it to $owner"
+  fi
+  if [ -n "$cur" ] && [ "$cur" != "$owner" ] && acct_exists "$cur"; then
+    cred_install "$ACCOUNTS/$cur/credentials.json" "$cur"
+    warn "put ${B}$cur${RST}'s credential back - exit the claude sessions still open as $owner"
+  fi
+}
+
+# True when the live .claude.json identity is the one stored for $1.
+identity_matches() {  # $1=account name
+  python3 - "$CC_JSON" "$ACCOUNTS/$1/identity.json" <<'PYEOF'
+import json, os, sys
+def ident(p):
+    if not os.path.exists(p):
+        return None
+    try:
+        d = json.load(open(p))
+    except Exception:
+        return None
+    email = (d.get("oauthAccount") or {}).get("emailAddress")
+    return (email or "").strip().lower() or None
+# Match on the account's email alone. userID is not the account identifier: the
+# same userID has been observed against two different accounts, and it changes
+# across logins, so comparing it produced false mismatches - which silently
+# disabled the sync that keeps the vault from holding a consumed token.
+live, stored = ident(sys.argv[1]), ident(sys.argv[2])
+# Unknown on either side is not a mismatch we can act on - stay conservative
+# and only block when both are known and actually differ.
+raise SystemExit(1 if (live and stored and live != stored) else 0)
+PYEOF
+}
+
+# Refresh tokens rotate: each use consumes the old one. If the live credential
+# has moved on and the vault still holds the superseded token, restoring that
+# snapshot later gets invalid_grant and forces a browser re-login. Claude Code
+# rotates during a session and on /login, neither of which goes through
+# ccswitch - so sync opportunistically on every run rather than only on switch.
+sync_active() {
+  cred_exists || return 0
+  cred_live_ok || return 0
+
+  # Sync into whichever stored account the live credential actually belongs to,
+  # matched by email - not blindly into whatever is marked active. Signing in
+  # with /login inside Claude Code changes the live account without telling
+  # ccswitch, and the rotation that follows belongs to that account, not to the
+  # stale one. No match means we have no idea whose this is, so do nothing.
+  local cur; cur="$(account_for_live_identity || true)"
+  local tmp; tmp="$(mktemp)"
+  cred_read > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  [ -s "$tmp" ] || { rm -f "$tmp"; return 0; }
+
+  # The email says whose account is live, not whose token this is. A token
+  # from another stored account's login goes back to that account.
+  local owner
+  if owner="$(login_foreign_to "$tmp" "$cur")"; then
+    route_stray "$tmp" "$owner" "$cur"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  if [ -z "$cur" ] || ! acct_exists "$cur"; then rm -f "$tmp"; return 0; fi
+  local stored="$ACCOUNTS/$cur/credentials.json"
+  if ! cmp -s "$tmp" "$stored" && cred_newer "$tmp" "$stored"; then
+    mkdir -p "$ACCOUNTS/$cur"
+    mv "$tmp" "$stored"
+    chmod 600 "$stored"
+    mcp_absorb "$stored" "$cur"
+    identity_extract "$CC_JSON" > "$ACCOUNTS/$cur/identity.json"
+    chmod 600 "$ACCOUNTS/$cur/identity.json"
+    # The live credential is this account's, so this account is what is signed
+    # in - follow it rather than leaving 'active' pointing somewhere stale.
+    note_host "$cur"
+    printf '%s\n' "$cur" > "$ACTIVE_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# --- commands ---------------------------------------------------------------
+# Local sign-out keeps a saved credential and the shared MCP pool, without
+# revoking the login at Anthropic. Requiring a tracked identity prevents an
+# unrelated, manually signed-in account from being discarded.
+cmd_logout_local() {
+  local cur backup blank
+  cur="$(active_name)"
+  [ -n "$cur" ] && acct_exists "$cur" && identity_matches "$cur" || die "Save the current Claude profile before signing out."
+  cred_live_ok || die "The current login is unavailable."
+  save_active
+  backup="$(mktemp)"; blank="$(mktemp)"
+  identity_extract "$CC_JSON" > "$backup"
+  printf '{}\n' > "$blank"
+  if ! identity_apply "$CC_JSON" "$blank"; then rm -f "$backup" "$blank"; die "Could not update Claude identity."; fi
+  if [ "$BACKEND" = keychain ]; then
+    if ! security delete-generic-password -a "$(kc_account)" -s "$(kc_service)" >/dev/null 2>&1; then
+      identity_apply "$CC_JSON" "$backup"; rm -f "$backup" "$blank"; die "Could not clear the live Claude login."
+    fi
+  else
+    if ! rm -f "$CRED"; then identity_apply "$CC_JSON" "$backup"; rm -f "$backup" "$blank"; die "Could not clear the live Claude login."; fi
+  fi
+  rm -f "$backup" "$blank" "$ACTIVE_FILE"
+  info "signed out locally; saved profile and MCP sign-ins remain available"
+}
+
+cmd_add() {
+  local n="${1:-}"; [ -n "$n" ] || die "usage: ccswitch add <name>"
+  validate_name "$n"
+  acct_exists "$n" && die "account '$n' already exists (use 'ccswitch rm $n' first)"
+  capture_into "$n"
+  printf '%s\n' "$n" > "$ACTIVE_FILE"
+  info "${GRN}added${RST} $n  ($(acct_email "$n"))"
+}
+
+cmd_use() {
+  local n="${1:-}" force="${2:-}"
+  [ -n "$n" ] || die "usage: ccswitch use <name>"
+  acct_exists "$n" || die "no such account '$n' (see: ccswitch list)"
+
+  if [ "$n" = "$(active_name)" ]; then
+    info "already on ${B}$n${RST}"
+    return 0
+  fi
+
+  local open=""
+  if claude_running; then
+    [ "$force" = "--force" ] || die "a claude process is running - exit it first, or pass --force"
+    open=1
+  fi
+
+  local prev; prev="$(active_name)"
+  save_active
+  restore_from "$n"
+
+  # Judge by the refresh token, as list does. The access token lapses every ~8h
+  # by design and Claude Code renews it on first use, so its expiry says nothing
+  # about whether the account needs a re-login.
+  local st; st="$(cred_state "$ACCOUNTS/$n/credentials.json")"
+  local acc="${st%%|*}" ref="${st##*|}"
+  info "${GRN}switched to${RST} ${B}$n${RST}  ($(acct_email "$n"))  $(fmt_relogin "$ref")"
+  if [ "$acc" = "dead" ]; then
+    warn "this account is signed out - run 'ccswitch login $n'"
+  elif [ "$ref" != "none" ] && [ "$ref" -le 0 ]; then
+    warn "this login has expired - run 'ccswitch login $n'"
+  fi
+  # An open session keeps its account's token and renews it in the background.
+  # ccswitch files those renewals under the right account, but only when it next
+  # runs, and a session that exits first takes its newest token with it.
+  if [ -n "$open" ] && [ -n "$prev" ]; then
+    warn "claude sessions still open as ${B}$prev${RST} keep renewing its token - exit them before switching back to $prev"
+  fi
+}
+
+cmd_list() {
+  local cur; cur="$(active_name)"
+  local found=0
+  printf '%s  %-12s %-30s %-20s %-8s%s\n' "$B" "ACCOUNT" "EMAIL" "STATUS" "RELOGIN" "$RST"
+  for d in "$ACCOUNTS"/*/; do
+    [ -d "$d" ] || continue
+    found=1
+    local n; n="$(basename "$d")"
+    local mark="  "; [ "$n" = "$cur" ] && mark="${GRN}* ${RST}"
+    local st; st="$(cred_state "$d/credentials.json")"
+    printf '%s%-12s %-30s %-20s %-8s\n' "$mark" "$n" "$(acct_email "$n")" \
+      "$(fmt_status "${st%%|*}")" "$(fmt_days "${st##*|}")"
+  done
+  [ "$found" = 1 ] || info "${DIM}no accounts yet - run: ccswitch login <name>${RST}"
+  warn_if_shared
+  update_notice
+}
+
+cmd_current() {
+  local cur; cur="$(active_name)"
+  [ -n "$cur" ] || { info "none"; return 1; }
+  printf '%s\n' "$cur"
+}
+
+cmd_login() {
+  local n="${1:-}"; [ -n "$n" ] || die "usage: ccswitch login <name>"
+  validate_name "$n"
+  command -v claude >/dev/null 2>&1 || die "the 'claude' command was not found on PATH"
+
+  claude_running && die "a claude process is running - exit it first"
+
+  save_active
+
+  # Clear the live credential so Claude Code prompts for a fresh sign-in.
+  cred_clear
+  local tmp_id; tmp_id="$(mktemp)"
+  echo '{}' > "$tmp_id"
+  identity_apply "$CC_JSON" "$tmp_id"
+  rm -f "$tmp_id"
+
+  info "Starting Claude Code. Run ${B}/login${RST} inside it, then exit with ${B}/exit${RST}."
+  info ""
+  claude || true
+  info ""
+
+  if ! cred_exists; then
+    warn "no credential was written - sign-in did not complete. Nothing saved."
+    local cur; cur="$(active_name)"
+    [ -n "$cur" ] && acct_exists "$cur" && { restore_from "$cur"; info "restored previous account: $cur"; }
+    return 1
+  fi
+
+  capture_into "$n"
+  # A fresh sign-in comes without MCP tokens; hand it the shared ones.
+  restore_from "$n"
+  info "${GRN}saved${RST} $n  ($(acct_email "$n"))  $(fmt_left "$(acct_expiry "$n")")"
+}
+
+cmd_rm() {
+  local n="${1:-}"; [ -n "$n" ] || die "usage: ccswitch rm <name>"
+  acct_exists "$n" || die "no such account '$n'"
+  rm -rf "${ACCOUNTS:?}/$n"
+  [ "$n" = "$(active_name)" ] && rm -f "$ACTIVE_FILE"
+  info "removed $n"
+}
+
+cmd_rename() {
+  local o="${1:-}" n="${2:-}"
+  if [ -z "$o" ] || [ -z "$n" ]; then die "usage: ccswitch rename <old> <new>"; fi
+  validate_name "$n"
+  acct_exists "$o" || die "no such account '$o'"
+  acct_exists "$n" && die "account '$n' already exists"
+  mv "$ACCOUNTS/$o" "$ACCOUNTS/$n"
+  [ "$o" = "$(active_name)" ] && printf '%s\n' "$n" > "$ACTIVE_FILE"
+  info "renamed $o -> $n"
+}
+
+# Which stored account, if any, the live identity belongs to.
+account_for_live_identity() {
+  local d n
+  for d in "$ACCOUNTS"/*/; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"
+    if identity_matches "$n"; then printf '%s\n' "$n"; return 0; fi
+  done
+  return 1
+}
+
+cmd_save() {
+  local n="${1:-}"
+  if [ -n "$n" ]; then
+    acct_exists "$n" || die "no such account '$n' (see: ccswitch list)"
+  else
+    n="$(active_name)"
+    [ -n "$n" ] || die "no active account to save"
+    # Signing in with /login inside Claude Code changes the live account
+    # without telling ccswitch, leaving 'active' pointing elsewhere. Saving
+    # blindly would write this credential over a different account's slot.
+    if ! identity_matches "$n"; then
+      local owner; owner="$(account_for_live_identity || true)"
+      if [ -n "$owner" ]; then
+        die "the live credential belongs to '$owner', not the active account '$n'.
+       Run 'ccswitch save $owner' to store it there."
+      fi
+      die "the live credential does not match the active account '$n', and no
+       stored account matches it. Run 'ccswitch add <name>' to store it as new,
+       or 'ccswitch save $n' to write it into '$n' anyway."
+    fi
+  fi
+  capture_into "$n"
+  printf '%s\n' "$n" > "$ACTIVE_FILE"
+  info "${GRN}saved${RST} live credential into $n"
+}
+
+# How close to the refresh token's expiry we start renewing it, in days.
+REFRESH_WINDOW_DAYS="${CCSWITCH_REFRESH_WINDOW_DAYS:-7}"
+
+cmd_refresh() {
+  local target="${1:-}" force="${2:-}" n names
+  names=()
+  if [ -z "$target" ] || [ "$target" = "--all" ]; then
+    for d in "$ACCOUNTS"/*/; do
+      [ -d "$d" ] || continue
+      names+=("$(basename "$d")")
+    done
+  else
+    acct_exists "$target" || die "no such account '$target' (see: ccswitch list)"
+    names=("$target")
+  fi
+  [ "${#names[@]}" -gt 0 ] || die "no stored accounts to refresh"
+
+  # Every refresh ROTATES the refresh token: the old one is consumed and a new
+  # one issued. A rotation we fail to capture leaves the vault holding a dead
+  # token, so refreshing is not free - do it only as the refresh token nears
+  # its expiry, not merely because the 8h access token lapsed.
+  local todo=() window=$(( REFRESH_WINDOW_DAYS * 86400 ))
+  for n in "${names[@]}"; do
+    local st; st="$(cred_state "$ACCOUNTS/$n/credentials.json")"
+    local racc="${st%%|*}" rref="${st##*|}"
+    if [ "$racc" = "dead" ]; then
+      warn "skip    $n  ($(acct_email "$n"))  signed out - run 'ccswitch login $n'"
+    elif [ "$force" = "--force" ]; then
+      todo+=("$n")
+    elif [ "$rref" != "none" ] && [ "$rref" -gt "$window" ]; then
+      info "${DIM}skip${RST}    $n  ($(acct_email "$n"))  re-login in $(fmt_days "$rref") - not due yet"
+    elif [ "$rref" = "none" ] && [ "$racc" != "none" ] && [ "$racc" -gt 0 ]; then
+      # Older credentials carry no refreshTokenExpiresAt. Fall back to the
+      # access token: a valid one means the refresh token was exercised
+      # recently, so rotating it again now would be risk without benefit.
+      info "${DIM}skip${RST}    $n  ($(acct_email "$n"))  $(fmt_left "$racc") - not due yet"
+    else
+      todo+=("$n")
+    fi
+  done
+  # The scheduled refresh is the natural place to do the network check, so
+  # 'list' can show the notice without ever reaching out itself.
+  update_check >/dev/null 2>&1 || true
+
+  [ "${#todo[@]}" -gt 0 ] || return 0
+
+  command -v claude >/dev/null 2>&1 || die "the 'claude' command was not found on PATH"
+  claude_running && die "a claude process is running - exit it first"
+
+  local started; started="$(active_name)"
+  local stash; stash="$(mktemp -d)"
+  # Preserve whatever is live now (tracked or not) so it can be put back
+  # exactly as found, even if it's not one of the accounts being refreshed.
+  cred_exists && cred_read > "$stash/credentials.json"
+  identity_extract "$CC_JSON" > "$stash/identity.json"
+
+  # Put the starting account back however we leave - including on Ctrl-C, which
+  # would otherwise strand the user signed in as whichever account the loop held.
+  # shellcheck disable=SC2317
+  _refresh_restore() {
+    if [ -n "$started" ] && acct_exists "$started"; then
+      restore_from "$started"
+    elif [ -f "$stash/credentials.json" ]; then
+      cred_install "$stash/credentials.json" ""
+      identity_apply "$CC_JSON" "$stash/identity.json"
+      rm -f "$ACTIVE_FILE"
+    else
+      cred_clear
+      rm -f "$ACTIVE_FILE"
+    fi
+    rm -rf "$stash"
+  }
+  trap '_refresh_restore; trap - INT TERM EXIT; exit 130' INT TERM
+  trap '_refresh_restore' EXIT
+
+  for n in "${todo[@]}"; do
+    local before; before="$(acct_expiry "$n")"
+    restore_from "$n"
+
+    # A minimal non-interactive call makes Claude Code exercise the refresh
+    # token. --allowedTools "" keeps it from touching anything; -p skips the
+    # workspace trust dialog.
+    local rc=0
+    (cd "$HOME" && claude -p "ok" --model haiku --allowedTools "" >/dev/null 2>&1) || rc=$?
+
+    # Capture regardless of exit status. Claude Code may have rotated the token
+    # before failing for an unrelated reason, and the replacement exists only in
+    # the live credential - losing it would strand the account for good.
+    if cred_live_ok; then
+      capture_into "$n" 2>/dev/null || warn "could not save the refreshed credential for $n"
+      local after; after="$(acct_expiry "$n")"
+      if [ "$after" != "none" ] && [ "$after" != "dead" ] &&
+         { [ "$before" = "none" ] || [ "$before" = "dead" ] || [ "$after" -gt "$before" ]; }; then
+        info "${GRN}refreshed${RST} $n  ($(acct_email "$n"))  $(fmt_left "$after")"
+      else
+        warn "$n ran but its expiry did not advance - token may not have been renewed"
+      fi
+    else
+      warn "could not refresh $n (exit $rc) - the server rejected its refresh token.
+       Run 'ccswitch login $n' to sign in again."
+    fi
+  done
+}
+
+cmd_sync() {
+  local before after
+  before="$(active_name)"
+  sync_active
+  after="$(active_name)"
+  if [ -n "$after" ]; then
+    if [ "$before" != "$after" ]; then
+      info "${GRN}synced${RST} live credential into ${B}$after${RST} (was on $before)"
+    else
+      info "${GRN}synced${RST} live credential into ${B}$after${RST}"
+    fi
+  else
+    info "nothing to sync"
+  fi
+}
+
+# Continuous capture. A rotation only reaches the vault when something runs
+# ccswitch, so a session that rotates and is then restored from an older
+# snapshot hands the server a consumed token. Watching the credential file
+# closes that window: every rotation is captured as it is written.
+AUTOSYNC_NAME="ccswitch-autosync"
+
+cmd_autosync() {
+  local action="${1:-status}"
+  if [ "$BACKEND" = "keychain" ]; then
+    die "autosync watches the credential file, and this machine stores the
+       credential in the macOS keychain, which cannot be watched that way.
+       Run 'ccswitch sync' after signing in, or switch with ccswitch."
+  fi
+
+  local ud="$HOME/.config/systemd/user"
+  local self; self="$(self_path)"
+  case "$(uname -s)" in
+    Linux) ;;
+    *) die "autosync currently supports systemd only (this is $(uname -s))" ;;
+  esac
+  command -v systemctl >/dev/null 2>&1 || die "systemctl was not found"
+  # WSL ships systemctl but does not run systemd as init unless it is switched
+  # on, and 'systemctl --user' then fails with a confusing message.
+  if [ ! -d /run/systemd/system ]; then
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+      die "systemd is not running. On WSL, enable it and restart the distro:
+       printf '[boot]\\nsystemd=true\\n' | sudo tee -a /etc/wsl.conf
+       then, from Windows: wsl --shutdown
+       Without it, run 'ccswitch sync' after signing in instead."
+    fi
+    die "systemd is not running as init, so a user path unit cannot be
+       installed. Run 'ccswitch sync' after signing in instead."
+  fi
+
+  case "$action" in
+    install)
+      mkdir -p "$ud"
+      cat > "$ud/$AUTOSYNC_NAME.service" <<EOF
+[Unit]
+Description=Capture a rotated Claude Code credential into the ccswitch vault
+
+[Service]
+Type=oneshot
+ExecStart=$self sync
+EOF
+      cat > "$ud/$AUTOSYNC_NAME.path" <<EOF
+[Unit]
+Description=Watch the Claude Code credential for token rotations
+
+[Path]
+PathModified=$CRED
+Unit=$AUTOSYNC_NAME.service
+
+[Install]
+WantedBy=default.target
+EOF
+      systemctl --user daemon-reload
+      systemctl --user enable --now "$AUTOSYNC_NAME.path" >/dev/null
+      info "${GRN}autosync installed${RST} - watching $CRED"
+      info "${DIM}every token rotation is now captured as it is written${RST}"
+      ;;
+    uninstall)
+      systemctl --user disable --now "$AUTOSYNC_NAME.path" >/dev/null 2>&1 || true
+      rm -f "$ud/$AUTOSYNC_NAME.path" "$ud/$AUTOSYNC_NAME.service"
+      systemctl --user daemon-reload
+      info "autosync removed"
+      ;;
+    status)
+      if systemctl --user is-active "$AUTOSYNC_NAME.path" >/dev/null 2>&1; then
+        info "${GRN}autosync is active${RST} - watching $CRED"
+      else
+        info "autosync is ${YLW}not installed${RST} - enable it with: ccswitch autosync install"
+      fi
+      ;;
+    *) die "usage: ccswitch autosync [install|uninstall|status]" ;;
+  esac
+}
+
+mcp_servers() {  # $1=file holding an mcpOAuth object, or a credential  -> names
+  python3 - "$1" <<'PYEOF'
+import json, os, sys
+p = sys.argv[1]
+try:
+    d = json.load(open(p)) if os.path.exists(p) else {}
+except Exception:
+    d = {}
+m = d.get("mcpOAuth", d) if isinstance(d, dict) else {}
+names = sorted({(v.get("serverName") if isinstance(v, dict) else None) or k.split("|")[0]
+                for k, v in (m if isinstance(m, dict) else {}).items()})
+print(", ".join(names) or "none")
+PYEOF
+}
+
+# Drop account $1's own MCP tokens, and when it is the live account put the
+# tokens it should now use in place.
+mcp_reset_slot() {  # $1=account name
+  local n="$1" slot="$ACCOUNTS/$1/credentials.json" tmp
+  if [ -f "$slot" ]; then
+    tmp="$(mktemp)"
+    mcp_with "$slot" "" > "$tmp"
+    mv "$tmp" "$slot"
+    chmod 600 "$slot"
+  fi
+  if [ "$n" = "$(active_name)" ] && [ -f "$slot" ]; then
+    cred_install "$slot" "$n"
+  fi
+}
+
+cmd_mcp() {
+  local sub="${1:-}" n="${2:-}" force="${3:-}"
+  case "$sub" in
+    ""|status|list)
+      mcp_pool_init
+      info "${B}shared${RST}  $(mcp_servers "$MCP_POOL")"
+      local d
+      for d in "$ACCOUNTS"/*/; do
+        [ -d "$d" ] || continue
+        n="$(basename "$d")"
+        if mcp_isolated "$n"; then
+          printf '  %-12s isolated  %s\n' "$n" "$(mcp_servers "$d/credentials.json")"
+        else
+          printf '  %-12s shared\n' "$n"
+        fi
+      done
+      ;;
+    isolate|share)
+      [ -n "$n" ] || die "usage: ccswitch mcp $sub <name>"
+      acct_exists "$n" || die "no such account '$n' (see: ccswitch list)"
+      if [ "$n" = "$(active_name)" ] && [ "$force" != "--force" ] && claude_running; then
+        die "a claude process is running as $n - exit it first, or pass --force"
+      fi
+      if [ "$sub" = "isolate" ]; then
+        mcp_isolated "$n" && { info "$n already keeps its own MCP sign-ins"; return 0; }
+        # The live tokens are already in the pool: every run syncs them first.
+        touch "$ACCOUNTS/$n/mcp-isolated"
+        mcp_reset_slot "$n"
+        info "${GRN}isolated${RST} $n - it signs in to MCP servers on its own; the shared sign-ins are kept for the other accounts"
+      else
+        mcp_isolated "$n" || { info "$n already uses the shared MCP sign-ins"; return 0; }
+        rm -f "$ACCOUNTS/$n/mcp-isolated"
+        mcp_reset_slot "$n"
+        info "${GRN}shared${RST} $n - it uses the shared MCP sign-ins again; its own were discarded"
+      fi
+      ;;
+    *) die "usage: ccswitch mcp [status | isolate <name> [--force] | share <name> [--force]]" ;;
+  esac
+}
+
+cmd_backup() {
+  local out="${1:-$HOME/ccswitch-backup-$(date +%F-%H%M).tar.gz}"
+  tar czf "$out" -C "$(dirname "$VAULT")" "$(basename "$VAULT")"
+  chmod 600 "$out"
+  info "backed up -> $out"
+  warn "this archive contains live session tokens - store it somewhere encrypted"
+}
+
+cmd_restore() {
+  local f="${1:-}"; [ -n "$f" ] || die "usage: ccswitch restore <file.tar.gz>"
+  [ -f "$f" ] || die "no such file: $f"
+  tar xzf "$f" -C "$(dirname "$VAULT")"
+  info "restored vault from $f"
+  cmd_list
+}
+
+# --- self-update ------------------------------------------------------------
+REPO_SLUG="${CCSWITCH_REPO:-2hmad/ccswitch}"
+NPM_PKG="@2hmad/ccswitch"
+NPM_REGISTRY="${CCSWITCH_NPM_REGISTRY:-https://registry.npmjs.org}"
+UPDATE_CACHE="$VAULT/.latest-version"
+
+# The real path of this script, following the symlink a package manager leaves
+# in its bin directory - npm's global bin is a symlink farm, so the link name
+# alone says nothing about where the package actually lives.
+self_path() {
+  local self
+  self="$(command -v ccswitch 2>/dev/null || printf '%s' "$0")"
+  python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$self" 2>/dev/null ||
+    printf '%s' "$self"
+}
+
+# Where this copy came from, so 'update' does not fight a package manager.
+install_method() {
+  local self; self="$(self_path)"
+  case "$self" in
+    *node_modules*)    printf 'npm' ;;
+    *Cellar*|*linuxbrew*|*homebrew*) printf 'brew' ;;
+    *)                 printf 'standalone' ;;
+  esac
+}
+
+fetch_url() {  # $1=url -> body on stdout, non-zero on failure
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 10 "$1"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- --timeout=10 "$1"
+  else
+    return 1
+  fi
+}
+
+# Latest version this copy can actually update to, without a leading v. An npm
+# copy asks the registry rather than GitHub: a tag whose npm publish failed is
+# a release npm users cannot install, so it must not be offered to them.
+latest_version() {
+  if [ "$(install_method)" = "npm" ]; then
+    fetch_url "$NPM_REGISTRY/$NPM_PKG/latest" 2>/dev/null |
+      python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("version") or "")
+except Exception:
+    pass' 2>/dev/null
+    return
+  fi
+  fetch_url "https://api.github.com/repos/$REPO_SLUG/releases/latest" 2>/dev/null |
+    python3 -c 'import json,sys
+try:
+    print((json.load(sys.stdin).get("tag_name") or "").lstrip("v"))
+except Exception:
+    pass' 2>/dev/null
+}
+
+# Update an npm copy through npm itself, so npm's own record of the package
+# stays true. Pin the exact version that was checked, not @latest, so what is
+# installed is what was reported.
+npm_update_to() {  # $1=version
+  command -v npm >/dev/null 2>&1 || die "npm is not on PATH - update with:
+       npm install -g $NPM_PKG@$1"
+  # --prefer-online: the version was just read live from the registry, but
+  # npm resolves from its metadata cache, which right after a release does not
+  # know the new version yet and fails with ETARGET.
+  info "running: npm install -g --prefer-online $NPM_PKG@$1"
+  npm install -g --prefer-online "$NPM_PKG@$1" ||
+    die "npm install failed - if it needs more permissions, run it yourself:
+       npm install -g $NPM_PKG@$1"
+  info "${GRN}updated${RST} $VERSION -> ${B}$1${RST}"
+}
+
+# Numeric compare: 0 when $1 is newer than $2.
+version_gt() {
+  [ "$1" != "$2" ] || return 1
+  python3 - "$1" "$2" <<'PYEOF'
+import sys
+def parts(v):
+    out = []
+    for chunk in v.split("."):
+        num = "".join(c for c in chunk if c.isdigit())
+        out.append(int(num) if num else 0)
+    return out
+a, b = parts(sys.argv[1]), parts(sys.argv[2])
+n = max(len(a), len(b))
+a += [0] * (n - len(a)); b += [0] * (n - len(b))
+raise SystemExit(0 if a > b else 1)
+PYEOF
+}
+
+# Refresh the cached "latest version" note. Network, so only called from
+# commands where a short pause is acceptable - never from 'use' or 'list'.
+update_check() {
+  local v; v="$(latest_version)"
+  [ -n "$v" ] || return 1
+  mkdir -p "$VAULT"
+  printf '%s\n' "$v" > "$UPDATE_CACHE" 2>/dev/null || true
+  printf '%s' "$v"
+}
+
+# Offline: print a one-line notice if the cache says a newer version exists.
+update_notice() {
+  [ -z "${CCSWITCH_NO_UPDATE_NOTICE:-}" ] || return 0
+  [ -f "$UPDATE_CACHE" ] || return 0
+  local v; v="$(cat "$UPDATE_CACHE" 2>/dev/null)"
+  [ -n "$v" ] || return 0
+  if version_gt "$v" "$VERSION"; then
+    info "${DIM}ccswitch $v is available (you have $VERSION) - run: ccswitch update${RST}"
+  fi
+}
+
+cmd_update() {
+  local check_only="" method
+  [ "${1:-}" != "--check" ] || check_only=1
+  method="$(install_method)"
+
+  info "current: ${B}$VERSION${RST}"
+  local where="GitHub"; [ "$method" != "npm" ] || where="the npm registry"
+  local latest; latest="$(update_check)" ||
+    die "could not reach $where to check for updates"
+  info "latest:  ${B}$latest${RST}"
+
+  if ! version_gt "$latest" "$VERSION"; then
+    info "${GRN}already up to date${RST}"
+    return 0
+  fi
+  [ -z "$check_only" ] || { info "run 'ccswitch update' to install it"; return 0; }
+
+  case "$method" in
+    npm)  npm_update_to "$latest"; return 0 ;;
+    brew) die "this copy was installed with Homebrew - update it with:
+       brew upgrade ccswitch" ;;
+  esac
+
+  local self; self="$(self_path)"
+  [ -w "$(dirname "$self")" ] ||
+    die "$self is not writable - reinstall with your package manager, or:
+       curl -fsSL https://raw.githubusercontent.com/$REPO_SLUG/main/install.sh | bash"
+
+  local tmp; tmp="$(mktemp)"
+  fetch_url "https://raw.githubusercontent.com/$REPO_SLUG/v$latest/bin/ccswitch" > "$tmp" ||
+    { rm -f "$tmp"; die "download failed"; }
+
+  # Refuse anything that is not plausibly the script - a captive-portal HTML
+  # page or a truncated download must never land on top of a working install.
+  if ! head -1 "$tmp" | grep -q '^#!.*bash' ||
+     ! grep -q "^VERSION=\"$latest\"" "$tmp" ||
+     [ "$(wc -c < "$tmp")" -lt 4096 ]; then
+    rm -f "$tmp"
+    die "downloaded file does not look like ccswitch $latest - refusing to install it"
+  fi
+  bash -n "$tmp" 2>/dev/null || { rm -f "$tmp"; die "downloaded file has a syntax error - refusing to install it"; }
+
+  chmod 755 "$tmp"
+  # Rename rather than overwrite: bash reads a script incrementally, so writing
+  # into the running file's inode would corrupt this very process.
+  mv "$tmp" "$self" || { rm -f "$tmp"; die "could not replace $self"; }
+  info "${GRN}updated${RST} $VERSION -> $latest"
+}
+
+cmd_doctor() {
+  local ok=0 _none=""
+  [ -n "$(active_name)" ] || _none="none"
+  printf '%sccswitch %s%s\n\n' "$B" "$VERSION" "$RST"
+  printf '  claude on PATH   : %s\n' "$(command -v claude || echo "${RED}not found${RST}")"
+  printf '  config dir       : %s\n' "$CC_DIR"
+  printf '  config json      : %s%s\n' "$CC_JSON" "$([ -f "$CC_JSON" ] || echo "  ${YLW}(missing)${RST}")"
+  printf '  credential store : %s\n' "$(if [ "$BACKEND" = keychain ]; then printf 'macOS keychain (service %s, account %s)' "$(kc_service)" "$(kc_account)"; else printf '%s' "$CRED"; fi)"
+  printf '  live credential  : %s\n' "$(cred_exists && echo present || echo "${YLW}absent${RST}")"
+  printf '  claude sessions  : %s\n' "$(claude_session_pids | tr '\n' ' ' | sed 's/ $//' || true)$(claude_running || echo none)"
+  printf '  vault            : %s\n' "$VAULT"
+  printf '  active account   : %s\n' "$(active_name)${_none}"
+  printf '  accounts stored  : %s\n' "$(find "$ACCOUNTS" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+  local _d _n _st
+  for _d in "$ACCOUNTS"/*/; do
+    [ -d "$_d" ] || continue
+    _n="$(basename "$_d")"; _st="$(cred_state "$_d/credentials.json")"
+    printf '    %-12s access %-18s re-login in %-5s last on %s\n' "$_n" \
+      "$(fmt_left "${_st%%|*}")" "$(fmt_days "${_st##*|}")" "$(head -1 "$_d/host" 2>/dev/null || echo '?')"
+  done
+  if for _d in "$ACCOUNTS"/*/; do [ -d "$_d" ] && foreign_host "$(basename "$_d")" >/dev/null && break; done; then
+    printf '\n  %swarning:%s an account above was last used on a different machine.\n' "$YLW" "$RST"
+    printf '  A refresh token rotates on every use, so only the machine holding the\n'
+    printf '  newest one stays signed in - the other gets a forced /login. Sharing a\n'
+    printf '  copied credential cannot work. Sign in separately on each machine\n'
+    printf "  ('ccswitch login <name>' there), or keep the account on one machine.\n"
+  fi
+  local _pair
+  while IFS= read -r _pair; do
+    [ -n "$_pair" ] || continue
+    printf '\n  %swarning:%s %s hold the same login.\n' "$YLW" "$RST" "$_pair"
+    printf '  A claude session left open as one account renewed its token while the\n'
+    printf '  other was live, and it was filed under the wrong name. Only one of them\n'
+    printf "  is right: run 'ccswitch login <name>' for the account that signs in wrong.\n"
+    ok=1
+  done <<<"$(shared_logins)"
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    printf '\n  %sCLAUDE_CONFIG_DIR is set%s (%s)\n' "$YLW" "$RST" "$CLAUDE_CONFIG_DIR"
+    printf '  ccswitch is operating on that directory rather than ~/.claude.\n'
+    printf '  If you previously used per-account CLAUDE_CONFIG_DIR wrappers,\n'
+    printf '  unset it so all accounts share one config.\n'
+    ok=1
+  fi
+  return $ok
+}
+
+cmd_completion() {
+  case "${1:-}" in
+    bash) cat <<'EOF'
+_ccswitch() {
+  local cur prev accounts
+  cur="${COMP_WORDS[COMP_CWORD]}"; prev="${COMP_WORDS[COMP_CWORD-1]}"
+  accounts=$(ls -1 "${CCSWITCH_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/ccswitch}/accounts" 2>/dev/null)
+  case "$prev" in
+    use|rm|rename|login|refresh|save) COMPREPLY=($(compgen -W "$accounts" -- "$cur")); return;;
+  esac
+  COMPREPLY=($(compgen -W "use add login list current rm rename mcp save sync autosync refresh backup restore doctor update completion help version" -- "$cur"))
+}
+complete -F _ccswitch ccswitch
+EOF
+    ;;
+    zsh) cat <<'EOF'
+#compdef ccswitch
+_ccswitch() {
+  local -a accounts cmds
+  accounts=(${(f)"$(ls -1 ${CCSWITCH_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/ccswitch}/accounts 2>/dev/null)"})
+  cmds=(use add login list current rm rename mcp save sync autosync refresh backup restore doctor update completion help version)
+  if (( CURRENT == 2 )); then
+    _describe 'command' cmds
+    _describe 'account' accounts
+  elif [[ $words[2] == (use|rm|rename|login|refresh|save) ]]; then
+    _describe 'account' accounts
+  fi
+}
+_ccswitch "$@"
+EOF
+    ;;
+    *) die "usage: ccswitch completion <bash|zsh>" ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+${B}ccswitch${RST} $VERSION - switch between Claude Code accounts
+
+  Everything stays shared - MCP servers, plugins, skills, agents, history,
+  settings and CLAUDE.md. Only the signed-in account changes.
+
+${B}USAGE${RST}
+  ccswitch <name>                switch to an account (shorthand for 'use')
+  ccswitch use <name> [--force]  switch to an account
+  ccswitch login <name>          sign a new account in and store it
+  ccswitch add <name>            store the currently signed-in account
+  ccswitch list                  list accounts, emails and token status
+  ccswitch current               print the active account name
+  ccswitch save [name]           write the live token back to its account
+  ccswitch sync                  capture the live token into the account it belongs to
+  ccswitch autosync install      capture every token rotation automatically
+  ccswitch refresh [name|--all] [--force]
+                                  refresh a stored token before it goes stale
+  ccswitch rm <name>             forget an account
+  ccswitch rename <old> <new>    rename an account
+  ccswitch mcp                   show which accounts share MCP server sign-ins
+  ccswitch mcp isolate <name>    give an account its own MCP sign-ins
+  ccswitch mcp share <name>      put an account back on the shared ones
+  ccswitch backup [file]         archive the vault
+  ccswitch restore <file>        restore a vault archive
+  ccswitch doctor                diagnose the setup
+  ccswitch update [--check]      update ccswitch itself to the latest release
+  ccswitch completion <bash|zsh> print a shell completion script
+
+${B}EXAMPLE${RST}
+  ccswitch login work
+  ccswitch login personal
+  ccswitch work
+  claude                         # runs as 'work'
+
+${B}ENVIRONMENT${RST}
+  CCSWITCH_HOME    vault location (default \$XDG_CONFIG_HOME/ccswitch)
+  CCSWITCH_BACKEND credential store: 'file' or 'keychain' (default: keychain
+                   on macOS, file elsewhere)
+  CCSWITCH_REFRESH_WINDOW_DAYS
+                   how close to the refresh token's expiry 'refresh' renews it
+                   (default 7)
+  CCSWITCH_NO_UPDATE_NOTICE
+                   set to any value to silence the 'update available' line
+  NO_COLOR         disable colour
+EOF
+}
+
+# --- dispatch ---------------------------------------------------------------
+cmd="${1:-}"; shift 2>/dev/null || true
+
+# The application uses the macOS Keychain. Check before pool initialization,
+# which can itself update the live item, so a running session cannot race it.
+case "$cmd" in
+  add|use|login|sync|logout-local|rm|remove|delete)
+    if claude_running; then die "Claude Code is running. Close all Claude Code sessions before switching or changing profiles."; fi
+    lock="$VAULT/.profile-switch-lock"
+    if ! mkdir "$lock" 2>/dev/null; then
+      oldpid="$(cat "$lock/pid" 2>/dev/null || true)"
+      case "$oldpid" in
+        ''|*[!0-9]*) die "Another Claude profile operation is in progress." ;;
+        *) if kill -0 "$oldpid" 2>/dev/null; then die "Another Claude profile operation is in progress."; fi ;;
+      esac
+      rm -f "$lock/pid" 2>/dev/null || true
+      rmdir "$lock" 2>/dev/null || die "Could not clear a previous Claude profile lock."
+      mkdir "$lock" 2>/dev/null || die "Another Claude profile operation is in progress."
+    fi
+    printf '%s\n' "$$" > "$lock/pid"
+    trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
+    ;;
+esac
+
+# Keep the active slot in step with the live credential before doing anything
+# that might read or replace it. Skipped for 'restore', which replaces the
+# whole vault, and for 'help'/'version', which touch nothing.
+case "$cmd" in
+  restore|help|-h|--help|version|-V|--version|completion|update|upgrade) ;;
+  *) mcp_pool_init; sync_active ;;
+esac
+case "$cmd" in
+  use)                cmd_use "${1:-}" "${2:-}" ;;
+  add)                cmd_add "${1:-}" ;;
+  login)              cmd_login "${1:-}" ;;
+  list|ls)            cmd_list ;;
+  current)            cmd_current ;;
+  save)               cmd_save "${1:-}" ;;
+  sync)               cmd_sync ;;
+  logout-local)       cmd_logout_local ;;
+  autosync)           cmd_autosync "${1:-}" ;;
+  refresh)            cmd_refresh "${1:-}" "${2:-}" ;;
+  rm|remove|delete)   cmd_rm "${1:-}" ;;
+  rename|mv)          cmd_rename "${1:-}" "${2:-}" ;;
+  mcp)                cmd_mcp "${1:-}" "${2:-}" "${3:-}" ;;
+  backup)             cmd_backup "${1:-}" ;;
+  restore)            cmd_restore "${1:-}" ;;
+  doctor)             cmd_doctor ;;
+  completion)         cmd_completion "${1:-}" ;;
+  update|upgrade)     cmd_update "${1:-}" ;;
+  version|-V|--version) info "ccswitch $VERSION" ;;
+  help|-h|--help)     usage ;;
+  "")                 cmd_list ;;
+  -*)                 die "unknown option: $cmd" ;;
+  *)                  cmd_use "$cmd" "${1:-}" ;;   # ccswitch <name>
+esac
