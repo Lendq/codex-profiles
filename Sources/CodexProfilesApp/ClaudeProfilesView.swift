@@ -72,8 +72,42 @@ struct ClaudeProfilesView: View {
                 confirmAction: { if let id = editID { model.update(id, name: name, symbol: symbol, tint: tint) }; editID = nil },
                 cancelAction: { editID = nil })
         }
+        .sheet(isPresented: Binding(get: { model.browserLogin != nil }, set: { if !$0 { model.cancelLogin() } })) {
+            if let login = model.browserLogin {
+                ClaudeBrowserLoginView(state: login, openAction: { if let url = login.authorizationURL { NSWorkspace.shared.open(url) } }, submitAction: { model.submitLoginCode($0) }, cancelAction: { model.cancelLogin() })
+            }
+        }
         .alert("Claude Code", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("OK") { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
+    }
+}
+
+private struct ClaudeBrowserLoginView: View {
+    let state: BrowserLoginState
+    let openAction: () -> Void
+    let submitAction: (String) -> Void
+    let cancelAction: () -> Void
+    @State private var code = ""
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "globe").font(.system(size: 22, weight: .medium)).foregroundStyle(.secondary)
+            Text(state.message).font(.system(size: 13, weight: .medium))
+            if let url = state.authorizationURL {
+                Text(url.absoluteString).font(.system(size: 11)).foregroundStyle(.secondary).textSelection(.enabled).lineLimit(3)
+            } else { ProgressView().controlSize(.small) }
+            SecureField("Authorization code (if requested)", text: $code).textFieldStyle(.roundedBorder)
+            HStack(spacing: 8) {
+                Button("Cancel", action: cancelAction).keyboardShortcut(.cancelAction)
+                Spacer()
+                if !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button("Submit Code") { submitAction(code); code = "" }
+                }
+                if state.authorizationURL != nil {
+                    Button(action: openAction) { Image(systemName: "arrow.up.forward.app").frame(width: 28, height: 28) }
+                        .help("Open sign-in in browser")
+                }
+            }
+        }.padding(18).frame(width: 320)
     }
 }

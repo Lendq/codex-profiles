@@ -738,6 +738,35 @@ cmd_logout_local() {
   info "signed out locally; saved profile and MCP sign-ins remain available"
 }
 
+# Save the current account without writing the live credential or its MCP pool.
+# A later switch, after Claude exits, syncs any token rotation before replacing it.
+cmd_snapshot_current() {
+  local n="${1:-}" tmp1 tmp2 cred staging active_tmp st
+  [ -n "$n" ] || die "usage: ccswitch snapshot-current <name>"
+  validate_name "$n"
+  acct_exists "$n" && die "account '$n' already exists"
+  cred_exists || die "no live Claude login was found"
+  tmp1="$(mktemp)"; tmp2="$(mktemp)"; cred="$(mktemp)"
+  identity_extract "$CC_JSON" > "$tmp1"
+  if ! cred_read > "$cred"; then rm -f "$tmp1" "$tmp2" "$cred"; die "Could not read the current Claude login."; fi
+  identity_extract "$CC_JSON" > "$tmp2"
+  st="$(cred_state "$cred")"
+  if ! cmp -s "$tmp1" "$tmp2" || [ "${st%%|*}" = dead ] || [ "${st%%|*}" = none ]; then
+    rm -f "$tmp1" "$tmp2" "$cred"; die "The current login changed or is unavailable; please try again."
+  fi
+  staging="$(mktemp -d "$ACCOUNTS/.snapshot.XXXXXX")"
+  if ! cp "$cred" "$staging/credentials.json" || ! cp "$tmp1" "$staging/identity.json" || ! chmod 700 "$staging" || ! chmod 600 "$staging/credentials.json" "$staging/identity.json"; then
+    rm -rf "$staging"; rm -f "$tmp1" "$tmp2" "$cred"; die "Could not save the Claude profile."
+  fi
+  rm -f "$tmp1" "$tmp2" "$cred"
+  if ! mv "$staging" "$ACCOUNTS/$n"; then rm -rf "$staging"; die "Could not save the Claude profile."; fi
+  active_tmp="$(mktemp "$VAULT/.active.XXXXXX")"
+  if ! printf '%s\n' "$n" > "$active_tmp" || ! mv "$active_tmp" "$ACTIVE_FILE"; then
+    rm -f "$active_tmp"; rm -rf "$ACCOUNTS/$n"; die "Could not mark the saved profile active."
+  fi
+  info "saved $n"
+}
+
 cmd_add() {
   local n="${1:-}"; [ -n "$n" ] || die "usage: ccswitch add <name>"
   validate_name "$n"
@@ -1481,8 +1510,8 @@ cmd="${1:-}"; shift 2>/dev/null || true
 # The application uses the macOS Keychain. Check before pool initialization,
 # which can itself update the live item, so a running session cannot race it.
 case "$cmd" in
-  add|use|login|sync|logout-local|rm|remove|delete)
-    if claude_running; then die "Claude Code is running. Close all Claude Code sessions before switching or changing profiles."; fi
+  snapshot-current|add|use|login|sync|logout-local|rm|remove|delete)
+    if [ "$cmd" != snapshot-current ] && claude_running; then die "Claude Code is running. Close all Claude Code sessions before switching or changing profiles."; fi
     lock="$VAULT/.profile-switch-lock"
     if ! mkdir "$lock" 2>/dev/null; then
       oldpid="$(cat "$lock/pid" 2>/dev/null || true)"
@@ -1503,12 +1532,13 @@ esac
 # that might read or replace it. Skipped for 'restore', which replaces the
 # whole vault, and for 'help'/'version', which touch nothing.
 case "$cmd" in
-  restore|help|-h|--help|version|-V|--version|completion|update|upgrade) ;;
+  restore|snapshot-current|help|-h|--help|version|-V|--version|completion|update|upgrade) ;;
   *) mcp_pool_init; sync_active ;;
 esac
 case "$cmd" in
   use)                cmd_use "${1:-}" "${2:-}" ;;
   add)                cmd_add "${1:-}" ;;
+  snapshot-current)   cmd_snapshot_current "${1:-}" ;;
   login)              cmd_login "${1:-}" ;;
   list|ls)            cmd_list ;;
   current)            cmd_current ;;

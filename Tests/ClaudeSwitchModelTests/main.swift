@@ -9,6 +9,7 @@ struct ProfileRow: Identifiable {
     var isSwitching = false; var shortcutNumber: Int? = nil
 }
 enum SortOrder { case recent, created, name }
+struct BrowserLoginState { var message: String; var authorizationURL: URL? }
 func check(_ condition: @autoclosure () -> Bool, _ message: String) { if !condition() { fatalError(message) } }
 @MainActor func runTests() throws {
     let fm = FileManager.default
@@ -18,7 +19,7 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String) { if !condit
     let fakeBin = root.appendingPathComponent("bin")
     try fm.createDirectory(at: fakeBin, withIntermediateDirectories: true)
     let pgrep = fakeBin.appendingPathComponent("pgrep")
-    try Data("#!/bin/sh\nexit 1\n".utf8).write(to: pgrep)
+    try Data("#!/bin/sh\nif [ -n \"${FAKE_RUNNING_PID:-}\" ]; then printf \"%s\\n\" \"$FAKE_RUNNING_PID\"; exit 0; fi\nexit 1\n".utf8).write(to: pgrep)
     try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: pgrep.path)
     let suite = "claude-test-" + UUID().uuidString
     let defaults = UserDefaults(suiteName: suite)!
@@ -37,10 +38,64 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String) { if !condit
     try creds("first", offset: 2400000000).write(to: root.appendingPathComponent(".claude/.credentials.json"))
     try creds("second", offset: 2500000000).write(to: source.appendingPathComponent(".credentials.json"))
     let helper = URL(fileURLWithPath: CommandLine.arguments[1])
-    let model = ClaudeSwitchModel(home: root, helper: helper, defaults: defaults, environmentOverrides: ["CCSWITCH_BACKEND":"file", "PATH":fakeBin.path+":/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"])
+    let liveProcess = Process(); liveProcess.executableURL = URL(fileURLWithPath: "/bin/sleep"); liveProcess.arguments = ["30"]
+    try liveProcess.run(); defer { if liveProcess.isRunning { liveProcess.terminate(); liveProcess.waitUntilExit() } }
+    let model = ClaudeSwitchModel(home: root, helper: helper, defaults: defaults, environmentOverrides: ["CCSWITCH_BACKEND":"file", "PATH":fakeBin.path+":/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin", "FAKE_RUNNING_PID":String(liveProcess.processIdentifier)])
     model.reload()
     check(model.rows.count == 2 && model.rows[0].title == "first@example.test" && model.rows[0].isUnsavedCurrent, "current account uses email")
     check(model.rows[1].title == "second@example.test", "old account uses email")
+    let beforeSnapshot = try Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json"))
+    model.saveCurrent()
+    let afterSnapshot = try Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json"))
+    check(model.errorMessage == nil && model.rows.contains { $0.isCurrent && !$0.isUnsavedCurrent }, "save current works while a session runs")
+    check(beforeSnapshot == afterSnapshot, "saving current does not change the live login")
+    // An isolated browser login never needs the live-switch helper or its guard.
+    let fakeClaude = fakeBin.appendingPathComponent("fake-claude")
+    let fakeScript = """
+    #!/bin/sh
+    [ "$1" = auth ] && [ "$2" = login ] || exit 7
+    [ -z "${ANTHROPIC_API_KEY:-}" ] || exit 8
+    [ -z "${CLAUDE_CODE_OAUTH_REFRESH_TOKEN:-}" ] || exit 10
+    [ -n "${CLAUDE_CONFIG_DIR:-}" ] || exit 9
+    printf '%s' '{"oauthAccount":{"emailAddress":"third@example.test"}}' > "$CLAUDE_CONFIG_DIR/.claude.json"
+    printf '%s\\n' 'https://claude.ai/oauth/authorize?test=1'
+    sleep 1
+    exit 0
+    """
+    try Data(fakeScript.utf8).write(to: fakeClaude)
+    try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fakeClaude.path)
+    let globalBefore = try Data(contentsOf: root.appendingPathComponent(".claude.json"))
+    let credentialBefore = try Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json"))
+    setenv("ANTHROPIC_API_KEY", "do-not-inherit", 1)
+    setenv("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "do-not-inherit", 1)
+    let loginModel = ClaudeSwitchModel(home: root, helper: helper, claude: fakeClaude, defaults: defaults, environmentOverrides: ["CCSWITCH_BACKEND":"file", "PATH":fakeBin.path+":/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"])
+    loginModel.reload(); loginModel.login()
+    check(loginModel.browserLogin != nil, "browser login is shown")
+    let urlDeadline = Date().addingTimeInterval(4)
+    while loginModel.browserLogin?.authorizationURL == nil && loginModel.browserLogin != nil && Date() < urlDeadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    check(loginModel.browserLogin?.authorizationURL?.host == "claude.ai", "browser login exposes the Anthropic authorization URL")
+    let deadline = Date().addingTimeInterval(8)
+    while loginModel.browserLogin != nil && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    unsetenv("ANTHROPIC_API_KEY"); unsetenv("CLAUDE_CODE_OAUTH_REFRESH_TOKEN")
+    check(loginModel.browserLogin == nil && loginModel.errorMessage == nil, "isolated browser login completed")
+    check(loginModel.rows.contains { $0.email == "third@example.test" }, "new account is listed")
+    let globalAfter = try Data(contentsOf: root.appendingPathComponent(".claude.json"))
+    let credentialAfter = try Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json"))
+    check(globalBefore == globalAfter && credentialBefore == credentialAfter, "sign-in leaves the active account untouched")
+    liveProcess.terminate(); liveProcess.waitUntilExit()
+    let failingClaude = fakeBin.appendingPathComponent("failing-claude")
+    try Data("#!/bin/sh\nexit 1\n".utf8).write(to: failingClaude)
+    try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: failingClaude.path)
+    let failingModel = ClaudeSwitchModel(home: root, helper: helper, claude: failingClaude, defaults: defaults, environmentOverrides: ["CCSWITCH_BACKEND":"file", "PATH":fakeBin.path+":/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"])
+    failingModel.reload(); let rowsBeforeFailure = failingModel.rows.count; failingModel.login()
+    let failureDeadline = Date().addingTimeInterval(8)
+    while failingModel.browserLogin != nil && Date() < failureDeadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    check(failingModel.errorMessage != nil && failingModel.rows.count == rowsBeforeFailure, "failed sign-in adds no profile")
+    let credentialAfterFailure = try Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json"))
+    check(credentialAfterFailure == credentialBefore, "failed sign-in keeps the live account")
+    // Remove this synthetic login so the remaining migration assertions stay focused.
+    if let addedID = loginModel.rows.first(where: { $0.email == "third@example.test" })?.profileID { loginModel.delete(addedID) }
+    model.reload()
     model.switchTo(oldID)
     check(model.errorMessage == nil, "migration and switch succeed")
     check(model.rows.count == 2 && model.rows.contains { $0.profileID == oldID && $0.isCurrent && $0.plan == "Pro" }, "migrated account is current with plan")

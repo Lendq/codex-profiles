@@ -21,6 +21,12 @@ final class ClaudeSwitchModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var busy = false
     @Published var loadingUsage = false
+    @Published var browserLogin: BrowserLoginState?
+    private var loginProcess: Process?
+    private var loginInput: Pipe?
+    private var loginOutput: Pipe?
+    private var loginBuffer = Data()
+    private var cancelledLogin = false
     private var usage: [String: UsageSnapshot] = [:]
     private var usageAttempts: [String: Date] = [:]
     private var appearances: [String: ClaudeAppearance] = [:]
@@ -28,9 +34,10 @@ final class ClaudeSwitchModel: ObservableObject {
     private let fm = FileManager.default
     private let homeOverride: URL?
     private let helperOverride: URL?
+    private let claudeOverride: URL?
     private let environmentOverrides: [String: String]
-    init(home: URL? = nil, helper: URL? = nil, defaults: UserDefaults = .standard, environmentOverrides: [String: String] = [:]) {
-        self.homeOverride = home; self.helperOverride = helper; self.defaults = defaults; self.environmentOverrides = environmentOverrides
+    init(home: URL? = nil, helper: URL? = nil, claude: URL? = nil, defaults: UserDefaults = .standard, environmentOverrides: [String: String] = [:]) {
+        self.homeOverride = home; self.helperOverride = helper; self.claudeOverride = claude; self.defaults = defaults; self.environmentOverrides = environmentOverrides
     }
     private var home: URL { homeOverride ?? fm.homeDirectoryForCurrentUser }
     private var vault: URL { home.appendingPathComponent(".config/codex-profiles-claude", isDirectory: true) }
@@ -165,7 +172,7 @@ final class ClaudeSwitchModel: ObservableObject {
         do { try run(["logout-local"]); reload() } catch { errorMessage = error.localizedDescription }
     }
     func saveCurrent() {
-        do { try run(["add", UUID().uuidString]); reload() } catch { errorMessage = error.localizedDescription }
+        do { try run(["snapshot-current", UUID().uuidString]); reload() } catch { errorMessage = error.localizedDescription }
     }
     func switchTo(_ id: UUID) {
         do {
@@ -258,12 +265,88 @@ final class ClaudeSwitchModel: ObservableObject {
         persistAppearances(); reload()
     }
     private func persistAppearances() { if let data = try? JSONEncoder().encode(appearances) { defaults.set(data, forKey: "claude_profile_appearances_v2") } }
+    private var claudeExecutable: URL? {
+        if let claudeOverride { return claudeOverride }
+        return [home.appendingPathComponent(".local/bin/claude"), URL(fileURLWithPath: "/opt/homebrew/bin/claude"), URL(fileURLWithPath: "/usr/local/bin/claude")].first { fm.isExecutableFile(atPath: $0.path) }
+    }
+    private func isolatedEnvironment(_ directory: URL) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        for key in ["CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_ANTHROPIC_AWS"] { env.removeValue(forKey: key) }
+        env["HOME"] = home.path
+        env["PATH"] = home.appendingPathComponent(".local/bin").path + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        env.merge(environmentOverrides) { _, override in override }
+        // Always select the new profile even when a caller supplies environment overrides.
+        env["CLAUDE_CONFIG_DIR"] = directory.path
+        return env
+    }
     func login(_ id: UUID? = nil) {
+        if id != nil { loginExisting(id!); return }
+        guard loginProcess == nil else { return }
+        errorMessage = nil
+        do {
+            guard let executable = claudeExecutable else { throw failure("Claude Code was not found. Install Claude Code and try again.") }
+            let profileID = UUID()
+            let dir = home.appendingPathComponent(".local/share/codex-profiles/claude", isDirectory: true).appendingPathComponent(profileID.uuidString, isDirectory: true)
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let process = Process(); let output = Pipe(); let input = Pipe()
+            process.executableURL = executable; process.arguments = ["auth", "login", "--claudeai"]
+            process.environment = isolatedEnvironment(dir); process.standardOutput = output; process.standardError = output; process.standardInput = input
+            cancelledLogin = false; loginBuffer = Data(); loginProcess = process; loginInput = input; loginOutput = output
+            browserLogin = BrowserLoginState(message: "Complete Claude sign-in in your browser.", authorizationURL: nil)
+            output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                let data = handle.availableData
+                guard !data.isEmpty else { return }
+                Task { @MainActor [weak self] in self?.receiveLoginOutput(data) }
+            }
+            process.terminationHandler = { [weak self] process in
+                let status = process.terminationStatus
+                Task { @MainActor [weak self] in self?.finishIsolatedLogin(id: profileID, directory: dir, status: status) }
+            }
+            do { try process.run() } catch {
+                output.fileHandleForReading.readabilityHandler = nil; loginProcess = nil; loginInput = nil; loginOutput = nil; browserLogin = nil
+                try? fm.removeItem(at: dir)
+                throw error
+            }
+        } catch { errorMessage = error.localizedDescription }
+    }
+    private func receiveLoginOutput(_ data: Data) {
+        guard loginProcess != nil else { return }
+        loginBuffer.append(data)
+        if loginBuffer.count > 65536 { loginBuffer.removeFirst(loginBuffer.count - 65536) }
+        guard browserLogin?.authorizationURL == nil, let output = String(data: loginBuffer, encoding: .utf8),
+              let range = output.range(of: #"https://[^\s<>\"']+"#, options: .regularExpression),
+              let url = URL(string: String(output[range]).trimmingCharacters(in: CharacterSet(charactersIn: ".,);]"))),
+              let host = url.host?.lowercased(), ["claude.ai", "claude.com", "anthropic.com"].contains(where: { host == $0 || host.hasSuffix("." + $0) }) else { return }
+        browserLogin?.authorizationURL = url
+    }
+    func submitLoginCode(_ code: String) {
+        guard let input = loginInput, !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        try? input.fileHandleForWriting.write(contentsOf: Data((code.trimmingCharacters(in: .whitespacesAndNewlines) + "\n").utf8))
+    }
+    func cancelLogin() {
+        cancelledLogin = true
+        if let process = loginProcess, process.isRunning { process.terminate() }
+        browserLogin = nil
+    }
+    private func finishIsolatedLogin(id: UUID, directory: URL, status: Int32) {
+        loginOutput?.fileHandleForReading.readabilityHandler = nil
+        try? loginInput?.fileHandleForWriting.close()
+        loginProcess = nil; loginInput = nil; loginOutput = nil; loginBuffer = Data(); browserLogin = nil
+        if cancelledLogin { return }
+        guard status == 0, let email = identityEmail(directory.appendingPathComponent(".claude.json")) else {
+            errorMessage = "Claude sign-in did not complete. Please try again. Your current session was not changed."
+            return
+        }
+        var old = (try? JSONDecoder().decode([ClaudeLegacyProfile].self, from: defaults.data(forKey: "claude_profiles_v1") ?? Data())) ?? []
+        old.append(ClaudeLegacyProfile(id: id, name: email, isDefault: false))
+        if let data = try? JSONEncoder().encode(old) { defaults.set(data, forKey: "claude_profiles_v1") }
+        reload()
+    }
+    private func loginExisting(_ id: UUID) {
         do {
             guard let helper else { throw failure("The Claude switching helper is missing.") }
-            // Preserve the currently signed-in account before the helper changes the live login.
             if !rows.contains(where: { $0.isCurrent && !$0.isUnsavedCurrent }), currentEmail != nil { try run(["add", UUID().uuidString]); reload() }
-            let name = (id ?? UUID()).uuidString
+            let name = id.uuidString
             let executablePath = home.appendingPathComponent(".local/bin").path + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
             let cmd = "env -u CLAUDE_CONFIG_DIR -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN CCSWITCH_HOME=" + ClaudeSupport.quote(vault.path) + " CCSWITCH_NO_UPDATE_NOTICE=1 PATH=" + ClaudeSupport.quote(executablePath) + " /bin/bash " + ClaudeSupport.quote(helper.path) + " login " + ClaudeSupport.quote(name)
             let script = "tell application \"Terminal\"\nactivate\ndo script \"" + cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"\nend tell"

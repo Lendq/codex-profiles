@@ -25,6 +25,25 @@ if ! grep -q 'Claude Code is running' "$TEMP_ROOT/out" || [ -e "$TEMP_ROOT/vault
     echo 'FAIL: running-session guard was late or missing' >&2; exit 1
 fi
 printf 'PASS: running-session guard prevents credential writes\n'
+# Saving the live account must be read-only even while a Claude session exists.
+mkdir -p "$TEMP_ROOT/live-home/.claude" "$TEMP_ROOT/live-vault"
+cat > "$TEMP_ROOT/live-home/.claude.json" <<'JSON'
+{"oauthAccount":{"emailAddress":"live@example.test"},"userID":"live","mcpServers":{"local":{"command":"fake"}}}
+JSON
+python3 - "$TEMP_ROOT/live-home/.claude/.credentials.json" <<'PYSNAPSHOT'
+import json,sys,time
+json.dump({'claudeAiOauth':{'accessToken':'live','refreshToken':'refresh','expiresAt':int((time.time()+3600)*1000)},'mcpOAuth':{'server':{'accessToken':'mcp'}}},open(sys.argv[1],'w'))
+PYSNAPSHOT
+cp "$TEMP_ROOT/live-home/.claude/.credentials.json" "$TEMP_ROOT/live-before"
+cp "$TEMP_ROOT/live-home/.claude.json" "$TEMP_ROOT/identity-before"
+env HOME="$TEMP_ROOT/live-home" CCSWITCH_HOME="$TEMP_ROOT/live-vault" CCSWITCH_BACKEND=file \
+  FAKE_RUNNING_PID="$TEST_SLEEP_PID" PATH="$TEMP_ROOT/bin:$PATH" \
+  bash "$ROOT/Vendor/ccswitch/bin/ccswitch" snapshot-current live >/dev/null
+cmp "$TEMP_ROOT/live-before" "$TEMP_ROOT/live-home/.claude/.credentials.json"
+cmp "$TEMP_ROOT/identity-before" "$TEMP_ROOT/live-home/.claude.json"
+[ -s "$TEMP_ROOT/live-vault/accounts/live/credentials.json" ] && [ ! -e "$TEMP_ROOT/live-vault/mcp-oauth.json" ]
+printf 'PASS: saving the current account while Claude runs leaves its login and MCP data untouched\n'
+
 # Reproduce the migration from an older isolated profile with fake Keychain items.
 mkdir -p "$TEMP_ROOT/migration-home/.claude" "$TEMP_ROOT/migration-home/old-profile" "$TEMP_ROOT/fake-keychain"
 cat > "$TEMP_ROOT/bin/uname" <<'STUB'
